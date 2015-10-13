@@ -36,7 +36,9 @@ import           Prelude
 import           Stack.Types.Compiler
 import           Stack.Types.Config
 import           Stack.Types.FlagName
+import           Stack.Types.GhcPkgId
 import           Stack.Types.PackageName
+import           Stack.Types.PackageIdentifier
 import           Stack.Types.Version
 
 -- | All exceptions thrown by the library.
@@ -98,6 +100,7 @@ data Package =
 newtype GetPackageOpts = GetPackageOpts
     { getPackageOpts :: forall env m. (MonadIO m,HasEnvConfig env, HasPlatform env, MonadThrow m, MonadReader env m, MonadLogger m, MonadCatch m)
                      => SourceMap
+                     -> InstalledMap
                      -> [PackageName]
                      -> Path Abs File
                      -> m (Map NamedComponent (Set ModuleName)
@@ -215,7 +218,10 @@ data LocalPackage = LocalPackage
 
     , lpDir            :: !(Path Abs Dir)  -- ^ Directory of the package.
     , lpCabalFile      :: !(Path Abs File) -- ^ The .cabal file
-    , lpDirtyFiles     :: !Bool            -- ^ are there files that have changed since the last build?
+    , lpDirtyFiles     :: !(Maybe (Set FilePath))
+    -- ^ Nothing == not dirty, Just == dirty. Note that the Set may be empty if
+    -- we forced the build to treat packages as dirty. Also, the Set may not
+    -- include all modified files.
     , lpNewBuildCache  :: !(Map FilePath FileCacheInfo) -- ^ current state of the files
     , lpFiles          :: !(Set (Path Abs File)) -- ^ all files used by this package
     , lpComponents     :: !(Set NamedComponent)
@@ -325,3 +331,8 @@ dotCabalGetPath dcp =
         DotCabalMainPath fp -> fp
         DotCabalFilePath fp -> fp
         DotCabalCFilePath fp -> fp
+
+type InstalledMap = Map PackageName (Version, InstallLocation, Installed) -- TODO Version is now redundant and can be gleaned from Installed
+
+data Installed = Library PackageIdentifier GhcPkgId | Executable PackageIdentifier
+    deriving (Show, Eq, Ord)

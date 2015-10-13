@@ -25,7 +25,7 @@ import           Data.Aeson.Extended
                  (ToJSON, toJSON, FromJSON, parseJSON, withText, object,
                   (.=), (..:), (..:?), (..!=), Value(String, Object),
                   withObjectWarnings, WarningParser, Object, jsonSubWarnings, JSONWarning,
-                  jsonSubWarningsT, jsonSubWarningsTT, tellJSONField)
+                  jsonSubWarningsT, jsonSubWarningsTT)
 import           Data.Attoparsec.Args
 import           Data.Binary (Binary)
 import           Data.ByteString (ByteString)
@@ -72,6 +72,8 @@ data Config =
          -- ^ Docker configuration
          ,configEnvOverride         :: !(EnvSettings -> IO EnvOverride)
          -- ^ Environment variables to be passed to external tools
+         ,configLocalProgramsBase   :: !(Path Abs Dir)
+         -- ^ Non-platform-specific path containing local installations
          ,configLocalPrograms       :: !(Path Abs Dir)
          -- ^ Path containing local installations (mainly GHC)
          ,configConnectionCount     :: !Int
@@ -141,7 +143,29 @@ data Config =
          -- ^ Additional SetupInfo (inline or remote) to use to find tools.
          ,configPvpBounds           :: !PvpBounds
          -- ^ How PVP upper bounds should be added to packages
+         ,configModifyCodePage      :: !Bool
+         -- ^ Force the code page to UTF-8 on Windows
+         ,configExplicitSetupDeps   :: !(Map (Maybe PackageName) Bool)
+         -- ^ See 'explicitSetupDeps'. 'Nothing' provides the default value.
+         ,configRebuildGhcOptions   :: !Bool
+         -- ^ Rebuild on GHC options changes
+         ,configApplyGhcOptions     :: !ApplyGhcOptions
+         -- ^ Which packages to ghc-options on the command line apply to?
          }
+
+-- | Which packages to ghc-options on the command line apply to?
+data ApplyGhcOptions = AGOTargets -- ^ all local targets
+                     | AGOLocals -- ^ all local packages, even non-targets
+                     | AGOEverything -- ^ every package
+  deriving (Show, Read, Eq, Ord, Enum, Bounded)
+
+instance FromJSON ApplyGhcOptions where
+    parseJSON = withText "ApplyGhcOptions" $ \t ->
+        case t of
+            "targets" -> return AGOTargets
+            "locals" -> return AGOLocals
+            "everything" -> return AGOEverything
+            _ -> fail $ "Invalid ApplyGhcOptions: " ++ show t
 
 -- | Information on a single package index
 data PackageIndex = PackageIndex
@@ -234,13 +258,12 @@ data EvalOpts = EvalOpts
 
 -- | Parsed global command-line options.
 data GlobalOpts = GlobalOpts
-    { globalReExec       :: !Bool
+    { globalReExecVersion :: !(Maybe String) -- ^ Expected re-exec in container version
     , globalLogLevel     :: !LogLevel -- ^ Log level
     , globalConfigMonoid :: !ConfigMonoid -- ^ Config monoid, for passing into 'loadConfig'
     , globalResolver     :: !(Maybe AbstractResolver) -- ^ Resolver override
     , globalTerminal     :: !Bool -- ^ We're in a terminal?
     , globalStackYaml    :: !(Maybe FilePath) -- ^ Override project stack.yaml
-    , globalModifyCodePage :: !Bool -- ^ Force the code page to UTF-8 on Windows
     } deriving (Show)
 
 -- | Either an actual resolver value, or an abstract description of one (e.g.,
@@ -575,6 +598,13 @@ data ConfigMonoid =
     -- ^ Additional setup info (inline or remote) to use for installing tools
     ,configMonoidPvpBounds           :: !(Maybe PvpBounds)
     -- ^ See 'configPvpBounds'
+    ,configMonoidModifyCodePage      :: !(Maybe Bool)
+    -- ^ See 'configModifyCodePage'
+    ,configMonoidExplicitSetupDeps   :: !(Map (Maybe PackageName) Bool)
+    -- ^ See 'configExplicitSetupDeps'
+    ,configMonoidRebuildGhcOptions   :: !(Maybe Bool)
+    -- ^ See 'configMonoidRebuildGhcOptions'
+    ,configMonoidApplyGhcOptions     :: !(Maybe ApplyGhcOptions)
     }
   deriving Show
 
@@ -606,6 +636,10 @@ instance Monoid ConfigMonoid where
     , configMonoidExtraPath = []
     , configMonoidSetupInfoLocations = mempty
     , configMonoidPvpBounds = Nothing
+    , configMonoidModifyCodePage = Nothing
+    , configMonoidExplicitSetupDeps = mempty
+    , configMonoidRebuildGhcOptions = Nothing
+    , configMonoidApplyGhcOptions = Nothing
     }
   mappend l r = ConfigMonoid
     { configMonoidDockerOpts = configMonoidDockerOpts l <> configMonoidDockerOpts r
@@ -635,6 +669,10 @@ instance Monoid ConfigMonoid where
     , configMonoidExtraPath = configMonoidExtraPath l ++ configMonoidExtraPath r
     , configMonoidSetupInfoLocations = configMonoidSetupInfoLocations l ++ configMonoidSetupInfoLocations r
     , configMonoidPvpBounds = configMonoidPvpBounds l <|> configMonoidPvpBounds r
+    , configMonoidModifyCodePage = configMonoidModifyCodePage l <|> configMonoidModifyCodePage r
+    , configMonoidExplicitSetupDeps = configMonoidExplicitSetupDeps l <> configMonoidExplicitSetupDeps r
+    , configMonoidRebuildGhcOptions = configMonoidRebuildGhcOptions l <|> configMonoidRebuildGhcOptions r
+    , configMonoidApplyGhcOptions = configMonoidApplyGhcOptions l <|> configMonoidApplyGhcOptions r
     }
 
 instance FromJSON (ConfigMonoid, [JSONWarning]) where
@@ -690,6 +728,12 @@ parseConfigMonoidJSON obj = do
         maybeToList <$> jsonSubWarningsT (obj ..:? "setup-info")
 
     configMonoidPvpBounds <- obj ..:? "pvp-bounds"
+    configMonoidModifyCodePage <- obj ..:? "modify-code-page"
+    configMonoidExplicitSetupDeps <-
+        (obj ..:? "explicit-setup-deps" ..!= mempty)
+        >>= fmap Map.fromList . mapM handleExplicitSetupDep . Map.toList
+    configMonoidRebuildGhcOptions <- obj ..:? "rebuild-ghc-options"
+    configMonoidApplyGhcOptions <- obj ..:? "apply-ghc-options"
 
     return ConfigMonoid {..}
   where
@@ -705,6 +749,16 @@ parseConfigMonoidJSON obj = do
         case parseArgs Escaping vals' of
             Left e -> fail e
             Right vals -> return (name, map T.pack vals)
+
+    handleExplicitSetupDep :: Monad m => (Text, Bool) -> m (Maybe PackageName, Bool)
+    handleExplicitSetupDep (name', b) = do
+        name <-
+            if name' == "*"
+                then return Nothing
+                else case parsePackageNameFromString $ T.unpack name' of
+                        Left e -> fail $ show e
+                        Right x -> return $ Just x
+        return (name, b)
 
 -- | Newtype for non-orphan FromJSON instance.
 newtype VersionRangeJSON = VersionRangeJSON { unVersionRangeJSON :: VersionRange }
@@ -933,9 +987,12 @@ bindirSuffix = $(mkRelDir "bin")
 docDirSuffix :: Path Rel Dir
 docDirSuffix = $(mkRelDir "doc")
 
--- | Suffix applied to an installation root to get the hpc dir
-hpcDirSuffix :: Path Rel Dir
-hpcDirSuffix = $(mkRelDir "hpc")
+-- | Where HPC reports and tix files get stored.
+hpcReportDir :: (MonadThrow m, MonadReader env m, HasEnvConfig env)
+             => m (Path Abs Dir)
+hpcReportDir = do
+   root <- installationRootLocal
+   return $ root </> $(mkRelDir "hpc")
 
 -- | Get the extra bin directories (for the PATH). Puts more local first
 --
@@ -1091,8 +1148,6 @@ parseDownloadInfoFromObject o = do
     url <- o ..: "url"
     contentLength <- o ..:? "content-length"
     sha1TextMay <- o ..:? "sha1"
-    -- Don't warn about 'version' field that is sometimes included
-    tellJSONField "version"
     return
         DownloadInfo
         { downloadInfoUrl = url
@@ -1121,6 +1176,7 @@ data SetupInfo = SetupInfo
     , siMsys2 :: Map Text VersionedDownloadInfo
     , siGHCs :: Map Text (Map Version DownloadInfo)
     , siGHCJSs :: Map Text (Map CompilerVersion DownloadInfo)
+    , siStack :: Map Text (Map Version DownloadInfo)
     }
     deriving Show
 
@@ -1131,8 +1187,7 @@ instance FromJSON (SetupInfo, [JSONWarning]) where
         siMsys2 <- jsonSubWarningsT (o ..:? "msys2" ..!= mempty)
         siGHCs <- jsonSubWarningsTT (o ..:? "ghc" ..!= mempty)
         siGHCJSs <- jsonSubWarningsTT (o ..:? "ghcjs" ..!= mempty)
-        -- Don't warn about 'portable-git' that is no-longer used
-        tellJSONField "portable-git"
+        siStack <- jsonSubWarningsTT (o ..:? "stack" ..!= mempty)
         return SetupInfo {..}
 
 -- | For @siGHCs@ and @siGHCJSs@ fields maps are deeply merged.
@@ -1145,6 +1200,7 @@ instance Monoid SetupInfo where
         , siMsys2 = Map.empty
         , siGHCs = Map.empty
         , siGHCJSs = Map.empty
+        , siStack = Map.empty
         }
     mappend l r =
         SetupInfo
@@ -1152,7 +1208,8 @@ instance Monoid SetupInfo where
         , siSevenzDll = siSevenzDll r <|> siSevenzDll l
         , siMsys2 = siMsys2 r <> siMsys2 l
         , siGHCs = Map.unionWith (<>) (siGHCs r) (siGHCs l)
-        , siGHCJSs = Map.unionWith (<>) (siGHCJSs r) (siGHCJSs l) }
+        , siGHCJSs = Map.unionWith (<>) (siGHCJSs r) (siGHCJSs l)
+        , siStack = Map.unionWith (<>) (siStack l) (siStack r) }
 
 -- | Remote or inline 'SetupInfo'
 data SetupInfoLocation
@@ -1196,3 +1253,17 @@ instance ToJSON PvpBounds where
   toJSON = toJSON . pvpBoundsText
 instance FromJSON PvpBounds where
   parseJSON = withText "PvpBounds" (either fail return . parsePvpBounds)
+
+-- | Provide an explicit list of package dependencies when running a custom Setup.hs
+explicitSetupDeps :: (MonadReader env m, HasConfig env) => PackageName -> m Bool
+explicitSetupDeps name = do
+    m <- asks $ configExplicitSetupDeps . getConfig
+    return $
+        -- Yes there are far cleverer ways to write this. I honestly consider
+        -- the explicit pattern matching much easier to parse at a glance.
+        case Map.lookup (Just name) m of
+            Just b -> b
+            Nothing ->
+                case Map.lookup Nothing m of
+                    Just b -> b
+                    Nothing -> False -- default value

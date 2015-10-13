@@ -4,6 +4,8 @@ Binary packages are signed with this [signing key](SIGNING_KEY.md).
 
 ## Windows
 
+*Note*: Due to specific Windows limitations, [some temporary workarounds](https://www.fpcomplete.com/blog/2015/08/stack-ghc-windows) may be required. It is strongly advised to set your `STACK_ROOT` environment variable similarly to your root (e.g., `set STACK_ROOT=c:\stack_root`) *before* running `stack`.
+
 * Download [the latest release](https://github.com/commercialhaskell/stack/releases/latest). Note: while generally i386/32-bit GHC is better tested on Windows, there are reports that recent versions of Windows only work with the 64-bit version of stack (see [issue #393](https://github.com/commercialhaskell/stack/issues/393)).
 * Unpack the archive and place `stack.exe` somewhere on your `%PATH%` (see [Path section below](#path)) and you can then run `stack` on the command line.
 * Now you can run `stack` from the terminal.
@@ -27,6 +29,10 @@ We generally test on the current version of OS X, but stack is known to work on 
         wget -q -O- https://s3.amazonaws.com/download.fpcomplete.com/ubuntu/fpco.key | sudo apt-key add -
 
 2. Add the appropriate source repository:
+
+    * Ubuntu 15.10 (amd64):
+
+        echo 'deb http://download.fpcomplete.com/ubuntu/wily stable main'|sudo tee /etc/apt/sources.list.d/fpco.list
 
     * Ubuntu 15.04 (amd64):
 
@@ -148,6 +154,10 @@ Alternatively, the package can be built from source as follows.
 
          nix-env -i -f shell.nix
 
+For more information on using Stack together with Nix, please see [the NixOS
+manual section on
+Stack](http://nixos.org/nixpkgs/manual/#using-stack-together-with-nix).
+
 ## Linux
 
 (64-bit and 32-bit options available)
@@ -173,4 +183,4 @@ There are essentially three different approaches to upgrade:
 
 * If you're using a package manager (e.g., the Ubuntu debs listed above) and are happy with sticking with the officially released binaries, simply follow your normal package manager strategies for upgrading (e.g. `apt-get update && apt-get upgrade`).
 * If you're not using a package manager but want to stick with the official binaries (such as on Windows or Mac), you'll need to manually follow the steps above to download the newest binaries from the release page and replace the old binary.
-* The `stack` tool itself ships with an `upgrade` command, which will build `stack` from source and install it to the default install path (see the previous section). You can use `stack upgrade` to get the latest official release, and `stack upgrade --git` to install from Git and leave on the bleeding edge. If you follow this, make sure that this directory is on your `PATH` and takes precedence over the system installed `stack`. For more information, see [this discussion](https://github.com/commercialhaskell/stack/issues/237#issuecomment-126793301).
+* The `stack` tool itself ships with an `upgrade` command, which will build `stack` from source and install it to the default install path (see the previous section). You can use `stack upgrade` to get the latest official release, and `stack upgrade --git` to install from Git and live on the bleeding edge. If you follow this, make sure that this directory is on your `PATH` and takes precedence over the system installed `stack`. For more information, see [this discussion](https://github.com/commercialhaskell/stack/issues/237#issuecomment-126793301).

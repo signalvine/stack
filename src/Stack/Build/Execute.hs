@@ -487,7 +487,9 @@ executePlan' installedMap plan ee@ExecuteEnv {..} = do
         generateLocalHaddockIndex eeEnvOverride wc eeBaseConfigOpts eeLocals
         generateDepsHaddockIndex eeEnvOverride wc eeBaseConfigOpts eeLocals
         generateSnapHaddockIndex eeEnvOverride wc eeBaseConfigOpts eeGlobalDB
-    when (toCoverage $ boptsTestOpts eeBuildOpts) generateHpcMarkupIndex
+    when (toCoverage $ boptsTestOpts eeBuildOpts) $ do
+        generateHpcUnifiedReport
+        generateHpcMarkupIndex
   where
     installedMap' = Map.difference installedMap
                   $ Map.fromList
@@ -598,7 +600,9 @@ ensureConfig newConfigCache pkgDir ExecuteEnv {..} announce cabal cabalfp = do
         deleteCaches pkgDir
         announce
         menv <- getMinimalEnvOverride
-        exes <- forM (words "ghc ghcjs") $ \name -> do
+        let programNames =
+                if eeCabalPkgVer < $(mkVersion "1.22") then ["ghc"] else ["ghc", "ghcjs"]
+        exes <- forM programNames $ \name -> do
             mpath <- findExecutable menv name
             return $ case mpath of
                 Nothing -> []
@@ -690,7 +694,7 @@ withSingleContext runInBase ActionContext {..} ExecuteEnv {..} task@Task {..} md
             , esStackExe = False
             , esLocaleUtf8 = True
             }
-        getRunhaskellPath <- runOnce $ liftIO $ join $ findExecutable menv "runhaskell"
+        getGhcPath <- runOnce $ liftIO $ join $ findExecutable menv "ghc"
         getGhcjsPath <- runOnce $ liftIO $ join $ findExecutable menv "ghcjs"
         distRelativeDir' <- distRelativeDir
         esetupexehs <-
@@ -707,7 +711,7 @@ withSingleContext runInBase ActionContext {..} ExecuteEnv {..} task@Task {..} md
                                                           eeCabalPkgVer)
                 packageArgs =
                     case mdeps of
-                        Just deps ->
+                        Just deps | explicitSetupDeps (packageName package) config ->
                             -- Stack always builds with the global Cabal for various
                             -- reproducibility issues.
                             let depsMinusCabal
@@ -736,13 +740,15 @@ withSingleContext runInBase ActionContext {..} ExecuteEnv {..} task@Task {..} md
                         -- 2. This doesn't provide enough packages: we should also
                         -- include the local database when building local packages.
                         --
-                        -- Currently, this branch is only taken via `stack sdist`.
-                        Nothing ->
-                            [ cabalPackageArg
-                            , "-clear-package-db"
-                            , "-global-package-db"
-                            , "-package-db=" ++ toFilePath (bcoSnapDB eeBaseConfigOpts)
-                            ]
+                        -- Currently, this branch is only taken via `stack
+                        -- sdist` or when explicitly requested in the
+                        -- stack.yaml file.
+                        _ ->
+                              cabalPackageArg
+                            : "-clear-package-db"
+                            : "-global-package-db"
+                            : map (("-package-db=" ++) . toFilePath) (bcoExtraDBs eeBaseConfigOpts)
+                           ++ ["-package-db=" ++ toFilePath (bcoSnapDB eeBaseConfigOpts)]
 
                 setupArgs = ("--builddir=" ++ toFilePath distRelativeDir') : args
                 runExe exeName fullArgs = do
@@ -802,17 +808,16 @@ withSingleContext runInBase ActionContext {..} ExecuteEnv {..} task@Task {..} md
             wc <- getWhichCompiler
             (exeName, fullArgs) <- case (esetupexehs, wc) of
                 (Left setupExe, _) -> return (setupExe, setupArgs)
-                (Right setuphs, Ghc) -> do
-                    exeName <- getRunhaskellPath
-                    let fullArgs = packageArgs ++ (toFilePath setuphs : setupArgs)
-                    return (exeName, fullArgs)
-                (Right setuphs, Ghcjs) -> do
+                (Right setuphs, compiler) -> do
                     distDir <- distDirFromDir pkgDir
                     let setupDir = distDir </> $(mkRelDir "setup")
                         outputFile = setupDir </> $(mkRelFile "setup")
                     createTree setupDir
-                    ghcjsPath <- getGhcjsPath
-                    runExe ghcjsPath $
+                    compilerPath <-
+                        case compiler of
+                            Ghc -> getGhcPath
+                            Ghcjs -> getGhcjsPath
+                    runExe compilerPath $
                         [ "--make"
                         , "-odir", toFilePath setupDir
                         , "-hidir", toFilePath setupDir
@@ -820,8 +825,10 @@ withSingleContext runInBase ActionContext {..} ExecuteEnv {..} task@Task {..} md
                         ] ++ packageArgs ++
                         [ toFilePath setuphs
                         , "-o", toFilePath outputFile
-                        , "-build-runner"
-                        ]
+                        ] ++
+                        (case compiler of
+                            Ghc -> []
+                            Ghcjs -> ["-build-runner"])
                     return (outputFile, setupArgs)
             runExe exeName $ (if boptsCabalVerbose eeBuildOpts then ("--verbose":) else id) fullArgs
 
@@ -878,7 +885,9 @@ singleBuild runInBase ac@ActionContext {..} ee@ExecuteEnv {..} task@Task {..} in
     getPrecompiled cache =
         case taskLocation task of
             Snap | not shouldHaddockPackage' -> do
-                mpc <- readPrecompiledCache taskProvides $ configCacheOpts cache
+                mpc <- readPrecompiledCache taskProvides
+                    (configCacheOpts cache)
+                    (configCacheDeps cache)
                 case mpc of
                     Nothing -> return Nothing
                     Just pc -> do
@@ -894,11 +903,18 @@ singleBuild runInBase ac@ActionContext {..} ee@ExecuteEnv {..} task@Task {..} in
         announceTask task "copying precompiled package"
         forM_ mlib $ \libpath -> do
             menv <- getMinimalEnvOverride
-            withMVar eeInstallLock $ \() ->
-                readProcessNull Nothing menv "ghc-pkg"
+            withMVar eeInstallLock $ \() -> do
+                -- We want to ignore the global and user databases.
+                -- Unfortunately, ghc-pkg doesn't take such arguments on the
+                -- command line. Instead, we'll set GHC_PACKAGE_PATH. See:
+                -- https://github.com/commercialhaskell/stack/issues/1146
+
+                menv' <- modifyEnvOverride menv
+                       $ Map.insert
+                            "GHC_PACKAGE_PATH"
+                            (T.pack $ toFilePath $ bcoSnapDB eeBaseConfigOpts)
+                readProcessNull Nothing menv' "ghc-pkg"
                     [ "register"
-                    , "--no-user-package-db"
-                    , "--package-db=" ++ toFilePath (bcoSnapDB eeBaseConfigOpts)
                     , "--force"
                     , libpath
                     ]
@@ -991,8 +1007,7 @@ singleBuild runInBase ac@ActionContext {..} ee@ExecuteEnv {..} task@Task {..} in
                              "found on PATH (use 'stack install hscolour' to install).")
                         return ["--hyperlink-source" | hscolourExists]
             cabal False (concat [["haddock", "--html", "--hoogle", "--html-location=../$pkg-$version/"]
-                                ,sourceFlag
-                                ,["--ghcjs" | wc == Ghcjs]])
+                                ,sourceFlag])
 
         withMVar eeInstallLock $ \() -> do
             announce "install"
@@ -1025,7 +1040,10 @@ singleBuild runInBase ac@ActionContext {..} ee@ExecuteEnv {..} task@Task {..} in
                     Set.empty
 
         case taskLocation task of
-            Snap -> writePrecompiledCache eeBaseConfigOpts taskProvides (configCacheOpts cache) mpkgid (packageExes package)
+            Snap -> writePrecompiledCache eeBaseConfigOpts taskProvides
+                (configCacheOpts cache)
+                (configCacheDeps cache)
+                mpkgid (packageExes package)
             Local -> return ()
 
         return mpkgid'
@@ -1064,7 +1082,10 @@ singleTest runInBase topts lptb ac ee task installedMap = do
 
         let needBuild = neededConfig ||
                 (case taskType task of
-                    TTLocal lp -> lpDirtyFiles lp
+                    TTLocal lp ->
+                        case lpDirtyFiles lp of
+                            Just _ -> True
+                            Nothing -> False
                     _ -> assert False True) ||
                 not testBuilt
 
@@ -1154,10 +1175,11 @@ singleTest runInBase topts lptb ac ee task installedMap = do
                         (Just inH, Nothing, Nothing, ph) <- liftIO $ createProcess_ "singleBuild.runTests" cp
                         liftIO $ hClose inH
                         ec <- liftIO $ waitForProcess ph
-                        -- Move the .tix file out of the package directory
-                        -- into the hpc work dir, for tidiness.
+                        -- Move the .tix file out of the package
+                        -- directory into the hpc work dir, for
+                        -- tidiness.
                         when needHpc $
-                            moveFileIfExists nameTix hpcDir
+                            updateTixFile nameTix (packageIdentifierString (packageIdentifier package))
                         return $ case ec of
                             ExitSuccess -> Map.empty
                             _ -> Map.singleton testName $ Just ec
@@ -1176,7 +1198,7 @@ singleTest runInBase topts lptb ac ee task installedMap = do
                         [ bcoSnapDB (eeBaseConfigOpts ee)
                         , bcoLocalDB (eeBaseConfigOpts ee)
                         ]
-                generateHpcReport pkgDir package testsToRun (findGhcPkgKey (eeEnvOverride ee) wc pkgDbs)
+                generateHpcReport package testsToRun (findGhcPkgKey (eeEnvOverride ee) wc pkgDbs)
 
             bs <- liftIO $
                 case mlogFile of
@@ -1217,7 +1239,10 @@ singleBench runInBase beopts _lptb ac ee task installedMap = do
 
         let needBuild = neededConfig ||
                 (case taskType task of
-                    TTLocal lp -> lpDirtyFiles lp
+                    TTLocal lp ->
+                        case lpDirtyFiles lp of
+                            Just _ -> True
+                            Nothing -> False
                     _ -> assert False True) ||
                 not benchBuilt
         when needBuild $ do

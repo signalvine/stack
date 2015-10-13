@@ -184,6 +184,25 @@ otherwise noted.
       # all users share a single database.
       database-path: "~/.stack/docker.db"
 
+      # Location of a Docker container-compatible 'stack' executable with the
+      # matching version. This executable must be built on linux-x86_64 and
+      # statically linked.
+      # Valid values are:
+      #   host: use the host's executable.  This is the default when the host's
+      #     executable is known to work (e.g., from official linux-x86_64 bindist)
+      #   download: download a compatible executable matching the host's version.
+      #     This is the default when the host's executable is not known to work
+      #   image: use the 'stack' executable baked into the image.  The version
+      #     must match the host's version
+      #   /path/to/stack: path on the host's local filesystem
+      stack-exe: host
+
+      # If true (the default when using the local Docker Engine), run processes
+      # in the Docker container as the same UID/GID as the host.  The ensures
+      # that files written by the container are owned by you on the host.
+      # When the Docker Engine is remote (accessed by tcp), defaults to false.
+      set-user: true
+
 Image Repositories
 -------------------------------------------------------------------------------
 
@@ -223,7 +242,9 @@ a 64-bit kernel. If you do not already have one, we suggest Ubuntu 14.04
 
 While Docker does support non-Linux operating systems through the `boot2docker`
 VM, there are issues with host volume mounting that prevent stack from being
-usable in this configuration.
+usable in this configuration. See
+[#194](https://github.com/commercialhaskell/stack/issues/194) for details and
+workarounds.
 
 ### Docker
 

@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -13,7 +14,6 @@ module Main where
 import           Control.Exception
 import qualified Control.Exception.Lifted as EL
 import           Control.Monad hiding (mapM, forM)
-import qualified Control.Monad.Catch as Catch
 import           Control.Monad.IO.Class
 import           Control.Monad.Logger
 import           Control.Monad.Reader (ask, asks, runReaderT)
@@ -31,6 +31,7 @@ import           Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
 import           Data.Traversable
+import           Data.Typeable (Typeable)
 import           Data.Version (showVersion)
 import           Distribution.System (buildArch)
 import           Distribution.Text (display)
@@ -79,51 +80,6 @@ import           System.FileLock (lockFile, tryLockFile, unlockFile, SharedExclu
 import           System.FilePath (dropTrailingPathSeparator, searchPathSeparator)
 import           System.IO (hIsTerminalDevice, stderr, stdin, stdout, hSetBuffering, BufferMode(..), hPutStrLn, Handle, hGetEncoding, hSetEncoding)
 import           System.Process.Read
-
-#ifdef WINDOWS
-import System.Win32.Console (setConsoleCP, setConsoleOutputCP, getConsoleCP, getConsoleOutputCP)
-#endif
-
--- | Set the code page for this process as necessary. Only applies to Windows.
--- See: https://github.com/commercialhaskell/stack/issues/738
-fixCodePage :: (MonadIO m, Catch.MonadMask m, MonadLogger m) => m a -> m a
-#ifdef WINDOWS
-fixCodePage inner = do
-    origCPI <- liftIO getConsoleCP
-    origCPO <- liftIO getConsoleOutputCP
-
-    let setInput = origCPI /= expected
-        setOutput = origCPO /= expected
-        fixInput
-            | setInput = Catch.bracket_
-                (liftIO $ do
-                    setConsoleCP expected)
-                (liftIO $ setConsoleCP origCPI)
-            | otherwise = id
-        fixOutput
-            | setInput = Catch.bracket_
-                (liftIO $ do
-                    setConsoleOutputCP expected)
-                (liftIO $ setConsoleOutputCP origCPO)
-            | otherwise = id
-
-    case (setInput, setOutput) of
-        (False, False) -> return ()
-        (True, True) -> warn ""
-        (True, False) -> warn " input"
-        (False, True) -> warn " output"
-
-    fixInput $ fixOutput inner
-  where
-    expected = 65001 -- UTF-8
-    warn typ = $logInfo $ T.concat
-        [ "Setting"
-        , typ
-        , " codepage to UTF-8 (65001) to ensure correct output from GHC"
-        ]
-#else
-fixCodePage = id
-#endif
 
 -- | Change the character encoding of the given Handle to transliterate
 -- on unsupported characters instead of throwing an exception
@@ -306,6 +262,10 @@ main = withInterpreterArgs stackProgName $ \args isInterpreter -> do
                                            "and package version.") <>
                                      value " " <>
                                      showDefault))
+             addCommand "query"
+                        "Query general build information (experimental)"
+                        queryCmd
+                        (many $ strArgument $ metavar "SELECTOR...")
              addSubCommands
                  "ide"
                  "IDE-specific commands"
@@ -379,6 +339,11 @@ main = withInterpreterArgs stackProgName $ \args isInterpreter -> do
          throwIO exitCode
        Right (global,run) -> do
          when (globalLogLevel global == LevelDebug) $ hPutStrLn stderr versionString'
+         case globalReExecVersion global of
+             Just expectVersion
+                 | expectVersion /= showVersion Meta.version ->
+                     throwIO $ InvalidReExecVersion expectVersion (showVersion Meta.version)
+             _ -> return ()
          run global `catch` \e -> do
             -- This special handler stops "stack: " from being printed before the
             -- exception
@@ -394,10 +359,9 @@ main = withInterpreterArgs stackProgName $ \args isInterpreter -> do
 -- support others later).
 pathCmd :: [Text] -> GlobalOpts -> IO ()
 pathCmd keys go =
-    withBuildConfigAndLock
+    withBuildConfig
         go
-        (\_ ->
-         do env <- ask
+        (do env <- ask
             let cfg = envConfig env
                 bc = envConfigBuildConfig cfg
             menv <- getMinimalEnvOverride
@@ -559,13 +523,16 @@ setupParser = SetupCmdOpts
     readVersion = do
         s <- readerAsk
         case parseCompilerVersion ("ghc-" <> T.pack s) of
-            Nothing -> readerError $ "Invalid version: " ++ s
+            Nothing ->
+                case parseCompilerVersion (T.pack s) of
+                    Nothing -> readerError $ "Invalid version: " ++ s
+                    Just x -> return x
             Just x -> return x
 
 setupCmd :: SetupCmdOpts -> GlobalOpts -> IO ()
 setupCmd SetupCmdOpts{..} go@GlobalOpts{..} = do
   (manager,lc) <- loadConfigWithOpts go
-  withUserFileLock (configStackRoot $ lcConfig lc) $ \lk ->
+  withUserFileLock go (configStackRoot $ lcConfig lc) $ \lk ->
    runStackTGlobal manager (lcConfig lc) go $
       Docker.reexecWithOptionalContainer
           (lcProjectRoot lc)
@@ -625,10 +592,11 @@ munlockFile (Just lk) = liftIO $ unlockFile lk
 -- this to an even more fine-grain locking approach.
 --
 withUserFileLock :: (MonadBaseControl IO m, MonadIO m)
-                 => Path Abs Dir
+                 => GlobalOpts
+                 -> Path Abs Dir
                  -> (Maybe FileLock -> m a)
                  -> m a
-withUserFileLock dir act = do
+withUserFileLock go@GlobalOpts{} dir act = do
     env <- liftIO getEnvironment
     let toLock = lookup "STACK_LOCK" env == Just "true"
     if toLock
@@ -644,12 +612,15 @@ withUserFileLock dir act = do
                         case fstTry of
                           Just lk -> EL.finally (act $ Just lk) (liftIO $ unlockFile lk)
                           Nothing ->
-                            do liftIO $ hPutStrLn stderr $ "Failed to grab lock ("++show pth++
-                                                   "); other stack instance running.  Waiting..."
+                            do let chatter = globalLogLevel go /= LevelOther "silent"
+                               when chatter $
+                                 liftIO $ hPutStrLn stderr $ "Failed to grab lock ("++show pth++
+                                                     "); other stack instance running.  Waiting..."
                                EL.bracket (liftIO $ lockFile (toFilePath pth) Exclusive)
                                           (liftIO . unlockFile)
                                           (\lk -> do
-                                            liftIO $ hPutStrLn stderr "Lock acquired, proceeding."
+                                            when chatter $
+                                              liftIO $ hPutStrLn stderr "Lock acquired, proceeding."
                                             act $ Just lk))
         else act Nothing
 
@@ -658,7 +629,7 @@ withConfigAndLock :: GlobalOpts
            -> IO ()
 withConfigAndLock go@GlobalOpts{..} inner = do
     (manager, lc) <- loadConfigWithOpts go
-    withUserFileLock (configStackRoot $ lcConfig lc) $ \lk ->
+    withUserFileLock go (configStackRoot $ lcConfig lc) $ \lk ->
      runStackTGlobal manager (lcConfig lc) go $
         Docker.reexecWithOptionalContainer (lcProjectRoot lc)
             Nothing
@@ -700,7 +671,7 @@ withBuildConfigExt
 withBuildConfigExt go@GlobalOpts{..} mbefore inner mafter = do
     (manager, lc) <- loadConfigWithOpts go
 
-    withUserFileLock (configStackRoot $ lcConfig lc) $ \lk0 -> do
+    withUserFileLock go (configStackRoot $ lcConfig lc) $ \lk0 -> do
       -- A local bit of state for communication between callbacks:
       curLk <- newIORef lk0
       let inner' lk =
@@ -709,7 +680,7 @@ withBuildConfigExt go@GlobalOpts{..} mbefore inner mafter = do
             -- trade in the lock here.
             do dir <- installationRootDeps
                -- Hand-over-hand locking:
-               withUserFileLock dir $ \lk2 -> do
+               withUserFileLock go dir $ \lk2 -> do
                  liftIO $ writeIORef curLk lk2
                  liftIO $ munlockFile lk
                  inner lk2
@@ -750,21 +721,13 @@ buildCmd opts go = do
     NoFileWatch -> inner $ const $ return ()
   where
     inner setLocalFiles = withBuildConfigAndLock go $ \lk ->
-        globalFixCodePage go $ Stack.Build.build setLocalFiles lk opts
+        Stack.Build.build setLocalFiles lk opts
     getProjectRoot = do
         (manager, lc) <- loadConfigWithOpts go
         bconfig <-
             runStackLoggingTGlobal manager go $
             lcLoadBuildConfig lc (globalResolver go)
         return (bcRoot bconfig)
-
-globalFixCodePage :: (Catch.MonadMask m, MonadIO m, MonadLogger m)
-                  => GlobalOpts
-                  -> m a
-                  -> m a
-globalFixCodePage go
-    | globalModifyCodePage go = fixCodePage
-    | otherwise = id
 
 uninstallCmd :: [String] -> GlobalOpts -> IO ()
 uninstallCmd _ go = withConfigAndLock go $ do
@@ -784,7 +747,7 @@ updateCmd () go = withConfigAndLock go $
     getMinimalEnvOverride >>= Stack.PackageIndex.updateAllIndices
 
 upgradeCmd :: (Bool, String) -> GlobalOpts -> IO ()
-upgradeCmd (fromGit, repo) go = withConfigAndLock go $ globalFixCodePage go $
+upgradeCmd (fromGit, repo) go = withConfigAndLock go $
     upgrade (if fromGit then Just repo else Nothing) (globalResolver go)
 
 -- | Upload to Hackage
@@ -852,11 +815,11 @@ execCmd ExecOpts {..} go@GlobalOpts{..} = do
     case eoExtra of
         ExecOptsPlain -> do
             (manager,lc) <- liftIO $ loadConfigWithOpts go
-            withUserFileLock (configStackRoot $ lcConfig lc) $ \lk ->
+            withUserFileLock go (configStackRoot $ lcConfig lc) $ \lk ->
              runStackTGlobal manager (lcConfig lc) go $
                 Docker.execWithOptionalContainer
                     (lcProjectRoot lc)
-                    (return (cmd, args, [], id))
+                    (\_ _ -> return (cmd, args, [], []))
                     -- Unlock before transferring control away, whether using docker or not:
                     (Just $ munlockFile lk)
                     (runStackTGlobal manager (lcConfig lc) go $ do
@@ -866,7 +829,7 @@ execCmd ExecOpts {..} go@GlobalOpts{..} = do
         ExecOptsEmbellished {..} ->
            withBuildConfigAndLock go $ \lk -> do
                let targets = concatMap words eoPackages
-               unless (null targets) $ globalFixCodePage go $
+               unless (null targets) $
                    Stack.Build.build (const $ return ()) lk defaultBuildOpts
                        { boptsTargets = map T.pack targets
                        }
@@ -888,7 +851,7 @@ ghciCmd :: GhciOpts -> GlobalOpts -> IO ()
 ghciCmd ghciOpts go@GlobalOpts{..} =
   withBuildConfigAndLock go $ \lk -> do
     let packageTargets = concatMap words (ghciAdditionalPackages ghciOpts)
-    unless (null packageTargets) $ globalFixCodePage go $
+    unless (null packageTargets) $
        Stack.Build.build (const $ return ()) lk defaultBuildOpts
            { boptsTargets = map T.pack packageTargets
            }
@@ -930,7 +893,7 @@ dockerPullCmd :: () -> GlobalOpts -> IO ()
 dockerPullCmd _ go@GlobalOpts{..} = do
     (manager,lc) <- liftIO $ loadConfigWithOpts go
     -- TODO: can we eliminate this lock if it doesn't touch ~/.stack/?
-    withUserFileLock (configStackRoot $ lcConfig lc) $ \_ ->
+    withUserFileLock go (configStackRoot $ lcConfig lc) $ \_ ->
      runStackTGlobal manager (lcConfig lc) go $
        Docker.preventInContainer Docker.pull
 
@@ -939,7 +902,7 @@ dockerResetCmd :: Bool -> GlobalOpts -> IO ()
 dockerResetCmd keepHome go@GlobalOpts{..} = do
     (manager,lc) <- liftIO (loadConfigWithOpts go)
     -- TODO: can we eliminate this lock if it doesn't touch ~/.stack/?
-    withUserFileLock (configStackRoot $ lcConfig lc) $ \_ ->
+    withUserFileLock go (configStackRoot $ lcConfig lc) $ \_ ->
      runStackLoggingTGlobal manager go $
         Docker.preventInContainer $ Docker.reset (lcProjectRoot lc) keepHome
 
@@ -948,7 +911,7 @@ dockerCleanupCmd :: Docker.CleanupOpts -> GlobalOpts -> IO ()
 dockerCleanupCmd cleanupOpts go@GlobalOpts{..} = do
     (manager,lc) <- liftIO $ loadConfigWithOpts go
     -- TODO: can we eliminate this lock if it doesn't touch ~/.stack/?
-    withUserFileLock (configStackRoot $ lcConfig lc) $ \_ ->
+    withUserFileLock go (configStackRoot $ lcConfig lc) $ \_ ->
      runStackTGlobal manager (lcConfig lc) go $
         Docker.preventInContainer $
             Docker.cleanup cleanupOpts
@@ -959,8 +922,7 @@ imgDockerCmd () go@GlobalOpts{..} = do
         go
         Nothing
         (\lk ->
-              do globalFixCodePage go $
-                     Stack.Build.build
+              do Stack.Build.build
                          (const (return ()))
                          lk
                          defaultBuildOpts
@@ -1028,3 +990,19 @@ dotCmd dotOpts go = withBuildConfigAndLock go (\_ -> dot dotOpts)
 listDependenciesCmd :: Text -> GlobalOpts -> IO ()
 listDependenciesCmd sep go = withBuildConfig go (listDependencies sep')
   where sep' = T.replace "\\t" "\t" (T.replace "\\n" "\n" sep)
+
+-- | Query build information
+queryCmd :: [String] -> GlobalOpts -> IO ()
+queryCmd selectors go = withBuildConfig go $ queryBuildInfo $ map T.pack selectors
+
+data MainException = InvalidReExecVersion String String
+     deriving (Typeable)
+instance Exception MainException
+instance Show MainException where
+    show (InvalidReExecVersion expected actual) = concat
+        [ "When re-executing '"
+        , stackProgName
+        , "' in a container, the incorrect version was found\nExpected: "
+        , expected
+        , "; found: "
+        , actual]

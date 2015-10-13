@@ -46,8 +46,7 @@ settings:
 * A list of subdirectories to build (useful for mega-repos like
 [wai](https://github.com/yesodweb/wai/) or
 [digestive-functors](https://github.com/jaspervdj/digestive-functors))
-* Whether a package should be treated as a dependency, in which case it will only be built if demanded by a non-dependency, and its test suites and benchmarks will not be run. This is useful for tweaking an upstream package.
-    * The current name for this is `valid-wanted`, which when `false` means "treat as a dependency." That's a confusing name choice, and therefore we're switching it to be `extra-dep: true` to mean "treat as dependency." You'll get a deprecation warning once that new naming is release.
+* Whether a package should be treated as a dependency: a package marked `extra-dep: true` will only be built if demanded by a non-dependency, and its test suites and benchmarks will not be run. This is useful for tweaking upstream packages.
 
 To tie this all together, here's an example of the different settings:
 
@@ -55,7 +54,7 @@ To tie this all together, here's an example of the different settings:
 packages:
 - local-package
 - location: vendor/binary
-  valid-wanted: false
+  extra-dep: true
 - location:
     git: git@github.com:yesodweb/wai
     commit: 2f8a8e1b771829f4a8a77c0111352ce45a14c30f
@@ -291,3 +290,59 @@ pvp-bounds: none
 ```
 
 For more information, see [the announcement blog post](https://www.fpcomplete.com/blog/2015/09/stack-pvp).
+
+### modify-code-page
+
+(Since 0.1.6)
+
+Modify the code page for UTF-8 output when running on Windows. Default behavior
+is to modify.
+
+```yaml
+modify-code-page: false
+```
+
+### explicit-setup-deps
+
+(Since 0.1.6)
+
+Decide whether a custom `Setup.hs` script should be run with an explicit list
+of dependencies based on the dependencies of the package itself, or simply
+provided the global package database. This option is most often needed when
+overriding packages in the global database, see [issue #1110](https://github.com/commercialhaskell/stack/issues/1110).
+
+Setting the list explicitly can help when a Setup.hs depends on packages in the
+local package database. For more information on that case, see [issue #897](https://github.com/commercialhaskell/stack/issues/897).
+
+Note that in the future, this should all disappear once Cabal provides full
+support for explicit Setup.hs dependencies.
+
+```yaml
+explicit-setup-deps:
+    "*": true # change the default
+    entropy: false # override the new default for one package
+```
+
+### rebuild-ghc-options
+
+(Since 0.1.6)
+
+Should we rebuild a package when its GHC options change? Before 0.1.6, this was a non-configurable true. However, in most cases, the flag is used to affect optimization levels and warning behavior, for which GHC itself doesn't actually recompile the modules anyway. Therefore, the new behavior is to not recompile on an options change, but this behavior can be changed back with the following:
+
+```yaml
+rebuild-ghc-options: true
+```
+
+### apply-ghc-options
+
+(Since 0.1.6)
+
+Which packages do ghc-options on the command line get applied to? Before 0.1.6, the default value was `targets`
+
+```yaml
+apply-ghc-options: locals # all local packages, the default
+# apply-ghc-options: targets # all local packages that are targets
+# apply-ghc-options: everything # applied even to snapshot and extra-deps
+```
+
+Note that `everything` is a slightly dangerous value, as it can break invariants about your snapshot database.

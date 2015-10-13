@@ -23,6 +23,7 @@ module Stack.Options
 
 import           Control.Monad.Logger (LogLevel(..))
 import           Data.Char (isSpace, toLower)
+import           Data.List (intercalate)
 import           Data.List.Split (splitOn)
 import qualified Data.Map as Map
 import           Data.Map.Strict (Map)
@@ -37,6 +38,7 @@ import           Options.Applicative.Builder.Extra
 import           Options.Applicative.Simple
 import           Options.Applicative.Types (readerAsk)
 import           Stack.Config (packagesParser)
+import           Stack.Constants (stackProgName)
 import           Stack.Docker
 import qualified Stack.Docker as Docker
 import           Stack.Dot
@@ -218,7 +220,7 @@ readFlag = do
 -- | Command-line arguments parser for configuration.
 configOptsParser :: Bool -> Parser ConfigMonoid
 configOptsParser docker =
-    (\opts systemGHC installGHC arch os ghcVariant jobs includes libs skipGHCCheck skipMsys localBin -> mempty
+    (\opts systemGHC installGHC arch os ghcVariant jobs includes libs skipGHCCheck skipMsys localBin modifyCodePage -> mempty
         { configMonoidDockerOpts = opts
         , configMonoidSystemGHC = systemGHC
         , configMonoidInstallGHC = installGHC
@@ -231,6 +233,7 @@ configOptsParser docker =
         , configMonoidExtraLibDirs = libs
         , configMonoidSkipMsys = skipMsys
         , configMonoidLocalBinPath = localBin
+        , configMonoidModifyCodePage = modifyCodePage
         })
     <$> dockerOptsParser docker
     <*> maybeBoolFlags
@@ -281,6 +284,10 @@ configOptsParser docker =
              <> metavar "DIR"
              <> help "Install binaries to DIR"
               ))
+    <*> maybeBoolFlags
+            "modify-code-page"
+            "setting the codepage to support UTF-8 (Windows only)"
+            idm
 
 -- | Options parser configuration for Docker.
 dockerOptsParser :: Bool -> Parser DockerOptsMonoid
@@ -342,6 +349,20 @@ dockerOptsParser showOptions =
                         hide <>
                         metavar "PATH" <>
                         help "Location of image usage tracking database")
+    <*> optional (option str
+            (long(dockerOptName dockerStackExeArgName) <>
+             hide <>
+             metavar (intercalate "|"
+                          [ dockerStackExeDownloadVal
+                          , dockerStackExeHostVal
+                          , dockerStackExeImageVal
+                          , "PATH" ]) <>
+             help (concat [ "Location of "
+                          , stackProgName
+                          , " executable used in container" ])))
+    <*> maybeBoolFlags (dockerOptName dockerSetUserArgName)
+                       "setting user in container to match host"
+                       hide
   where
     dockerOptName optName = dockerCmdName ++ "-" ++ T.unpack optName
     maybeStrOption = optional . option str
@@ -508,9 +529,9 @@ execOptsExtraParser = eoPlainParser <|>
 globalOptsParser :: Bool -> Parser GlobalOpts
 globalOptsParser defaultTerminal =
     GlobalOpts <$>
-    switch (long Docker.reExecArgName <>
-            hidden <>
-            internal) <*>
+    optional (strOption (long Docker.reExecArgName <>
+                         hidden <>
+                         internal)) <*>
     logLevelOptsParser <*>
     configOptsParser False <*>
     optional abstractResolverOptsParser <*>
@@ -523,11 +544,7 @@ globalOptsParser defaultTerminal =
     optional (strOption (long "stack-yaml" <>
                          metavar "STACK-YAML" <>
                          help ("Override project stack.yaml file " <>
-                               "(overrides any STACK_YAML environment variable)"))) <*>
-    boolFlags True
-        "modify-code-page"
-        "setting the codepage to support UTF-8 (Windows only)"
-        idm
+                               "(overrides any STACK_YAML environment variable)")))
 
 initOptsParser :: Parser InitOpts
 initOptsParser =
@@ -663,6 +680,9 @@ newOptsParser = (,) <$> newOpts <*> initOptsParser
         NewOpts <$>
         packageNameArgument
             (metavar "PACKAGE_NAME" <> help "A valid package name.") <*>
+        switch
+            (long "bare" <>
+             help "Do not create a subdirectory for the project") <*>
         templateNameArgument
             (metavar "TEMPLATE_NAME" <>
              help "Name of a template, for example: foo or foo.hsfiles" <>

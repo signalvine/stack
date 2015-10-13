@@ -180,6 +180,7 @@ parseTargetsFromBuildOpts needTargets bopts = do
     flagExtraDeps <- convertSnapshotToExtra
         snapshot
         (bcExtraDeps bconfig)
+        rawLocals
         (catMaybes $ Map.keys $ boptsFlags bopts)
 
     (cliExtraDeps, targets) <-
@@ -199,14 +200,16 @@ convertSnapshotToExtra
     :: MonadLogger m
     => Map PackageName Version -- ^ snapshot
     -> Map PackageName Version -- ^ extra-deps
+    -> Map PackageName a -- ^ locals
     -> [PackageName] -- ^ packages referenced by a flag
     -> m (Map PackageName Version)
-convertSnapshotToExtra snapshot extra0 flags0 =
+convertSnapshotToExtra snapshot extra0 locals flags0 =
     go Map.empty flags0
   where
     go !extra [] = return extra
     go extra (flag:flags)
         | Just _ <- Map.lookup flag extra0 = go extra flags
+        | flag `Map.member` locals = go extra flags
         | otherwise = case Map.lookup flag snapshot of
             Nothing -> go extra flags
             Just version -> do
@@ -335,7 +338,7 @@ loadLocalPackage bopts targets (name, (lpv, gpkg)) = do
         benchpkg = resolvePackage benchconfig gpkg
     mbuildCache <- tryGetBuildCache $ lpvRoot lpv
     (files,_) <- getPackageFilesSimple pkg (lpvCabalFP lpv)
-    (isDirty, newBuildCache) <- checkBuildCache
+    (dirtyFiles, newBuildCache) <- checkBuildCache
         (fromMaybe Map.empty mbuildCache)
         (map toFilePath $ Set.toList files)
 
@@ -349,7 +352,14 @@ loadLocalPackage bopts targets (name, (lpv, gpkg)) = do
                 Just _ -> Just exes
         , lpTestBench = btpkg
         , lpFiles = files
-        , lpDirtyFiles = isDirty || boptsForceDirty bopts
+        , lpDirtyFiles =
+            if not (Set.null dirtyFiles) || boptsForceDirty bopts
+                then let tryStripPrefix y =
+                            case stripPrefix (toFilePath $ lpvRoot lpv) y of
+                                Nothing -> y
+                                Just z -> z
+                      in Just $ Set.map tryStripPrefix dirtyFiles
+                else Nothing
         , lpNewBuildCache = newBuildCache
         , lpCabalFile = lpvCabalFP lpv
         , lpDir = lpvRoot lpv
@@ -452,15 +462,15 @@ extendExtraDeps extraDeps0 cliExtraDeps unknowns latestVersion
 checkBuildCache :: MonadIO m
                 => Map FilePath FileCacheInfo -- ^ old cache
                 -> [FilePath] -- ^ files in package
-                -> m (Bool, Map FilePath FileCacheInfo)
+                -> m (Set FilePath, Map FilePath FileCacheInfo)
 checkBuildCache oldCache files = liftIO $ do
-    (Any isDirty, m) <- fmap mconcat $ mapM go files
-    return (isDirty, m)
+    (dirtyFiles, m) <- fmap mconcat $ mapM go files
+    return (dirtyFiles, m)
   where
     go fp = do
         mmodTime <- getModTimeMaybe fp
         case mmodTime of
-            Nothing -> return (Any False, Map.empty)
+            Nothing -> return (Set.empty, Map.empty)
             Just modTime' -> do
                 (isDirty, newFci) <-
                     case Map.lookup fp oldCache of
@@ -475,7 +485,7 @@ checkBuildCache oldCache files = liftIO $ do
                         Nothing -> do
                             newFci <- calcFci modTime' fp
                             return (True, newFci)
-                return (Any isDirty, Map.singleton fp newFci)
+                return (if isDirty then Set.singleton fp else Set.empty, Map.singleton fp newFci)
 
 -- | Returns entries to add to the build cache for any newly found unlisted modules
 addUnlistedToBuildCache

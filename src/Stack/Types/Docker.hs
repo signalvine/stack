@@ -5,6 +5,8 @@
 module Stack.Types.Docker where
 
 import Control.Applicative
+import Control.Monad
+import Control.Monad.Catch (MonadThrow)
 import Data.Aeson.Extended
 import Data.Monoid
 import Data.Text (Text)
@@ -40,6 +42,10 @@ data DockerOpts = DockerOpts
     -- ^ Environment variables to set in the container.
   ,dockerDatabasePath :: !(Path Abs File)
     -- ^ Location of image usage database.
+  ,dockerStackExe :: !(Maybe DockerStackExe)
+    -- ^ Location of container-compatible stack executable
+  ,dockerSetUser :: !(Maybe Bool)
+   -- ^ Set in-container user to match host's
   }
   deriving (Show)
 
@@ -76,6 +82,10 @@ data DockerOptsMonoid = DockerOptsMonoid
     -- ^ Environment variables to set in the container
   ,dockerMonoidDatabasePath :: !(Maybe String)
     -- ^ Location of image usage database.
+  ,dockerMonoidStackExe :: !(Maybe String)
+    -- ^ Location of container-compatible stack executable
+  ,dockerMonoidSetUser :: !(Maybe Bool)
+   -- ^ Set in-container user to match host's
   }
   deriving (Show)
 
@@ -98,6 +108,8 @@ instance FromJSON (DockerOptsMonoid, [JSONWarning]) where
               dockerMonoidMount            <- o ..:? dockerMountArgName ..!= []
               dockerMonoidEnv              <- o ..:? dockerEnvArgName ..!= []
               dockerMonoidDatabasePath     <- o ..:? dockerDatabasePathArgName
+              dockerMonoidStackExe         <- o ..:? dockerStackExeArgName
+              dockerMonoidSetUser          <- o ..:? dockerSetUserArgName
               return DockerOptsMonoid{..})
 
 -- | Left-biased combine Docker options
@@ -117,6 +129,8 @@ instance Monoid DockerOptsMonoid where
     ,dockerMonoidMount            = []
     ,dockerMonoidEnv              = []
     ,dockerMonoidDatabasePath     = Nothing
+    ,dockerMonoidStackExe         = Nothing
+    ,dockerMonoidSetUser          = Nothing
     }
   mappend l r = DockerOptsMonoid
     {dockerMonoidExists           = dockerMonoidExists l <|> dockerMonoidExists r
@@ -133,7 +147,25 @@ instance Monoid DockerOptsMonoid where
     ,dockerMonoidMount            = dockerMonoidMount r <> dockerMonoidMount l
     ,dockerMonoidEnv              = dockerMonoidEnv r <> dockerMonoidEnv l
     ,dockerMonoidDatabasePath     = dockerMonoidDatabasePath l <|> dockerMonoidDatabasePath r
+    ,dockerMonoidStackExe         = dockerMonoidStackExe l <|> dockerMonoidStackExe r
+    ,dockerMonoidSetUser          = dockerMonoidSetUser l <|> dockerMonoidSetUser r
     }
+
+-- | Where to get the `stack` executable to run in Docker containers
+data DockerStackExe
+    = DockerStackExeDownload  -- ^ Download from official bindist
+    | DockerStackExeHost  -- ^ Host's `stack` (linux-x86_64 only)
+    | DockerStackExeImage  -- ^ Docker image's `stack` (versions must match)
+    | DockerStackExePath (Path Abs File) -- ^ Executable at given path
+    deriving (Show)
+
+-- | Parse 'DockerStackExe'.
+parseDockerStackExe :: (MonadThrow m) => String -> m DockerStackExe
+parseDockerStackExe t
+    | t == dockerStackExeDownloadVal = return DockerStackExeDownload
+    | t == dockerStackExeHostVal = return DockerStackExeHost
+    | t == dockerStackExeImageVal = return DockerStackExeImage
+    | otherwise = liftM DockerStackExePath (parseAbsFile t)
 
 -- | Docker volume mount.
 data Mount = Mount String String
@@ -217,3 +249,23 @@ dockerPersistArgName = "persist"
 -- | Docker database path argument name.
 dockerDatabasePathArgName :: Text
 dockerDatabasePathArgName = "database-path"
+
+-- | Docker database path argument name.
+dockerStackExeArgName :: Text
+dockerStackExeArgName = "stack-exe"
+
+-- | Value for @--docker-stack-exe=download@
+dockerStackExeDownloadVal :: String
+dockerStackExeDownloadVal = "download"
+
+-- | Value for @--docker-stack-exe=host@
+dockerStackExeHostVal :: String
+dockerStackExeHostVal = "host"
+
+-- | Value for @--docker-stack-exe=image@
+dockerStackExeImageVal :: String
+dockerStackExeImageVal = "image"
+
+-- | Docker @set-user@ argument name
+dockerSetUserArgName :: Text
+dockerSetUserArgName = "set-user"

@@ -3,17 +3,20 @@
 {-# LANGUAGE OverloadedStrings     #-}
 {-# LANGUAGE RecordWildCards       #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
+{-# LANGUAGE TemplateHaskell       #-}
 {-# LANGUAGE TupleSections         #-}
+{-# LANGUAGE ViewPatterns          #-}
 -- | Construct a @Plan@ for how to build
 module Stack.Build.ConstructPlan
     ( constructPlan
     ) where
 
+import           Control.Arrow ((&&&))
 import           Control.Exception.Lifted
 import           Control.Monad
 import           Control.Monad.Catch (MonadCatch)
 import           Control.Monad.IO.Class
-import           Control.Monad.Logger (MonadLogger)
+import           Control.Monad.Logger (MonadLogger, logWarn)
 import           Control.Monad.RWS.Strict
 import           Control.Monad.Trans.Resource
 import qualified Data.ByteString.Char8 as S8
@@ -40,25 +43,25 @@ import           Stack.Build.Installed
 import           Stack.Build.Source
 import           Stack.Types.Build
 import           Stack.BuildPlan
-
 import           Stack.Package
+import           Stack.PackageDump
 import           Stack.PackageIndex
 import           Stack.Types
 
 data PackageInfo
-    = PIOnlyInstalled Version InstallLocation Installed
+    = PIOnlyInstalled InstallLocation Installed
     | PIOnlySource PackageSource
     | PIBoth PackageSource Installed
 
 combineSourceInstalled :: PackageSource
-                       -> (Version, InstallLocation, Installed)
+                       -> (InstallLocation, Installed)
                        -> PackageInfo
-combineSourceInstalled ps (version, location, installed) =
-    assert (piiVersion ps == version) $
+combineSourceInstalled ps (location, installed) =
+    assert (piiVersion ps == installedVersion installed) $
     assert (piiLocation ps == location) $
     case location of
         -- Always trust something in the snapshot
-        Snap -> PIOnlyInstalled version location installed
+        Snap -> PIOnlyInstalled location installed
         Local -> PIBoth ps installed
 
 type CombinedMap = Map PackageName PackageInfo
@@ -67,11 +70,11 @@ combineMap :: SourceMap -> InstalledMap -> CombinedMap
 combineMap = Map.mergeWithKey
     (\_ s i -> Just $ combineSourceInstalled s i)
     (fmap PIOnlySource)
-    (fmap (\(v, l, i) -> PIOnlyInstalled v l i))
+    (fmap (\(l, i) -> PIOnlyInstalled l i))
 
 data AddDepRes
     = ADRToInstall Task
-    | ADRFound InstallLocation Version Installed
+    | ADRFound InstallLocation Installed
     deriving Show
 
 data W = W
@@ -82,10 +85,12 @@ data W = W
     -- ^ why a local package is considered dirty
     , wDeps :: !(Set PackageName)
     -- ^ Packages which count as dependencies
+    , wWarnings :: !([Text] -> [Text])
+    -- ^ Warnings
     }
 instance Monoid W where
-    mempty = W mempty mempty mempty mempty
-    mappend (W a b c d) (W w x y z) = W (mappend a w) (mappend b x) (mappend c y) (mappend d z)
+    mempty = W mempty mempty mempty mempty mempty
+    mappend (W a b c d e) (W w x y z z') = W (mappend a w) (mappend b x) (mappend c y) (mappend d z) (mappend e z')
 
 type M = RWST
     Ctx
@@ -104,6 +109,7 @@ data Ctx = Ctx
     , extraToBuild   :: !(Set PackageName)
     , latestVersions :: !(Map PackageName Version)
     , wanted         :: !(Set PackageName)
+    , localNames     :: !(Set PackageName)
     }
 
 instance HasStackRoot Ctx
@@ -121,12 +127,13 @@ constructPlan :: forall env m.
               -> BaseConfigOpts
               -> [LocalPackage]
               -> Set PackageName -- ^ additional packages that must be built
-              -> Map GhcPkgId PackageIdentifier -- ^ locally registered
+              -> [DumpPackage () ()] -- ^ locally registered
               -> (PackageName -> Version -> Map FlagName Bool -> IO Package) -- ^ load upstream package
               -> SourceMap
               -> InstalledMap
               -> m Plan
-constructPlan mbp0 baseConfigOpts0 locals extraToBuild0 locallyRegistered loadPackage0 sourceMap installedMap = do
+constructPlan mbp0 baseConfigOpts0 locals extraToBuild0 localDumpPkgs loadPackage0 sourceMap installedMap = do
+    let locallyRegistered = Map.fromList $ map (dpGhcPkgId &&& dpPackageIdent) localDumpPkgs
     menv <- getMinimalEnvOverride
     caches <- getPackageCaches menv
     let latest = Map.fromListWith max $ map toTuple $ Map.keys caches
@@ -143,7 +150,9 @@ constructPlan mbp0 baseConfigOpts0 locals extraToBuild0 locallyRegistered loadPa
     let inner = do
             mapM_ onWanted $ filter lpWanted locals
             mapM_ (addDep False) $ Set.toList extraToBuild0
-    ((), m, W efinals installExes dirtyReason deps) <- liftIO $ runRWST inner (ctx econfig latest) M.empty
+    ((), m, W efinals installExes dirtyReason deps warnings) <-
+        liftIO $ runRWST inner (ctx econfig latest) M.empty
+    mapM_ $logWarn (warnings [])
     let toEither (_, Left e)  = Left e
         toEither (k, Right v) = Right (k, v)
         (errlibs, adrs) = partitionEithers $ map toEither $ M.toList m
@@ -151,7 +160,7 @@ constructPlan mbp0 baseConfigOpts0 locals extraToBuild0 locallyRegistered loadPa
         errs = errlibs ++ errfinals
     if null errs
         then do
-            let toTask (_, ADRFound _ _ _) = Nothing
+            let toTask (_, ADRFound _ _) = Nothing
                 toTask (name, ADRToInstall task) = Just (name, task)
                 tasks = M.fromList $ mapMaybe toTask adrs
                 takeSubset =
@@ -183,6 +192,7 @@ constructPlan mbp0 baseConfigOpts0 locals extraToBuild0 locallyRegistered loadPa
         , extraToBuild = extraToBuild0
         , latestVersions = latest
         , wanted = wantedLocalPackages locals
+        , localNames = Set.fromList $ map (packageName . lpPackage) locals
         }
     -- TODO Currently, this will only consider and install tools from the
     -- snapshot. It will not automatically install build tools from extra-deps
@@ -275,9 +285,9 @@ addDep'' treatAsDep name = do
         -- TODO look up in the package index and see if there's a
         -- recommendation available
         Nothing -> return $ Left $ UnknownPackage name
-        Just (PIOnlyInstalled version loc installed) -> do
-            tellExecutablesUpstream name version loc Map.empty -- slightly hacky, no flags since they likely won't affect executable names
-            return $ Right $ ADRFound loc version installed
+        Just (PIOnlyInstalled loc installed) -> do
+            tellExecutablesUpstream name (installedVersion installed) loc Map.empty -- slightly hacky, no flags since they likely won't affect executable names
+            return $ Right $ ADRFound loc installed
         Just (PIOnlySource ps) -> do
             tellExecutables name ps
             installPackage treatAsDep name ps
@@ -286,7 +296,7 @@ addDep'' treatAsDep name = do
             needInstall <- checkNeedInstall treatAsDep name ps installed (wanted ctx)
             if needInstall
                 then installPackage treatAsDep name ps
-                else return $ Right $ ADRFound (piiLocation ps) (piiVersion ps) installed
+                else return $ Right $ ADRFound (piiLocation ps) installed
 
 tellExecutables :: PackageName -> PackageSource -> M () -- TODO merge this with addFinal above?
 tellExecutables _ (PSLocal lp)
@@ -309,7 +319,7 @@ tellExecutablesPackage loc p = do
     let myComps =
             case Map.lookup (packageName p) cm of
                 Nothing -> assert False Set.empty
-                Just (PIOnlyInstalled _ _ _) -> Set.empty
+                Just (PIOnlyInstalled _ _) -> Set.empty
                 Just (PIOnlySource ps) -> goSource ps
                 Just (PIBoth ps _) -> goSource ps
 
@@ -398,14 +408,45 @@ addPackageDeps treatAsDep package = do
                             UnknownPackage name -> assert (name == depname) NotInBuildPlan
                             _ -> Couldn'tResolveItsDependencies
                  in return $ Left (depname, (range, mlatest, bd))
-            Right adr | not $ adrVersion adr `withinRange` range ->
-                return $ Left (depname, (range, mlatest, DependencyMismatch $ adrVersion adr))
-            Right (ADRToInstall task) -> return $ Right
-                (Set.singleton $ taskProvides task, Map.empty, taskLocation task)
-            Right (ADRFound loc _ (Executable _)) -> return $ Right
-                (Set.empty, Map.empty, loc)
-            Right (ADRFound loc _ (Library ident gid)) -> return $ Right
-                (Set.empty, Map.singleton ident gid, loc)
+            Right adr -> do
+                inRange <- if adrVersion adr `withinRange` range
+                    then return True
+                    else do
+                        let warn reason = do
+                                tell mempty { wWarnings = (msg:) }
+                              where
+                                msg = T.concat
+                                    [ "WARNING: Ignoring out of range dependency"
+                                    , reason
+                                    , ": "
+                                    , T.pack $ packageIdentifierString $ PackageIdentifier depname (adrVersion adr)
+                                    , ". "
+                                    , T.pack $ packageNameString $ packageName package
+                                    , " requires: "
+                                    , versionRangeText range
+                                    ]
+                        allowNewer <- asks $ configAllowNewer . getConfig
+                        if allowNewer
+                            then do
+                                warn " (allow-newer enabled)"
+                                return True
+                            else do
+                                x <- inSnapshot (packageName package) (packageVersion package)
+                                y <- inSnapshot depname (adrVersion adr)
+                                if x && y
+                                    then do
+                                        warn " (trusting snapshot over Hackage revisions)"
+                                        return True
+                                    else return False
+                if inRange
+                    then case adr of
+                        ADRToInstall task -> return $ Right
+                            (Set.singleton $ taskProvides task, Map.empty, taskLocation task)
+                        ADRFound loc (Executable _) -> return $ Right
+                            (Set.empty, Map.empty, loc)
+                        ADRFound loc (Library ident gid) -> return $ Right
+                            (Set.empty, Map.singleton ident gid, loc)
+                    else return $ Left (depname, (range, mlatest, DependencyMismatch $ adrVersion adr))
     case partitionEithers deps of
         ([], pairs) -> return $ Right $ mconcat pairs
         (errs, _) -> return $ Left $ DependencyPlanFailures
@@ -415,7 +456,7 @@ addPackageDeps treatAsDep package = do
             (Map.fromList errs)
   where
     adrVersion (ADRToInstall task) = packageIdentifierVersion $ taskProvides task
-    adrVersion (ADRFound _ v _) = v
+    adrVersion (ADRFound _ installed) = installedVersion installed
 
 checkDirtiness :: PackageSource
                -> Installed
@@ -497,16 +538,25 @@ describeConfigDiff config old new
         go
       where
         go [] = []
-        go ("--ghc-option":_:xs) = go xs
-        go ("--ghc-options":_:xs) = go xs
-        go (x:xs)
-          | isPrefixed x = go xs
-          | otherwise = x : go xs
+        go ("--ghc-option":x:xs) = go' x xs
+        go ("--ghc-options":x:xs) = go' x xs
+        go ((T.stripPrefix "--ghc-option=" -> Just x):xs) = go' x xs
+        go ((T.stripPrefix "--ghc-options=" -> Just x):xs) = go' x xs
+        go (x:xs) = x : go xs
 
-        isPrefixed t = any (`T.isPrefixOf` t)
-            [ "--ghc-option="
-            , "--ghc-options="
-            ]
+        go' x xs = checkKeepers x $ go xs
+
+        checkKeepers x xs =
+            case filter isKeeper $ T.words x of
+                [] -> xs
+                keepers -> "--ghc-options" : T.unwords keepers : xs
+
+        -- GHC options which affect build results and therefore should always
+        -- force a rebuild
+        --
+        -- For the most part, we only care about options generated by Stack
+        -- itself
+        isKeeper = (== "-fhpc") -- more to be added later
 
     userOpts = filter (not . isStackOpt)
              . (if configRebuildGhcOptions config
@@ -577,3 +627,13 @@ stripNonDeps deps plan = plan
 
 markAsDep :: PackageName -> M ()
 markAsDep name = tell mempty { wDeps = Set.singleton name }
+
+-- | Is the given package/version combo defined in the snapshot?
+inSnapshot :: PackageName -> Version -> M Bool
+inSnapshot name version = do
+    p <- asks mbp
+    ls <- asks localNames
+    return $ fromMaybe False $ do
+        guard $ not $ name `Set.member` ls
+        mpi <- Map.lookup name (mbpPackages p)
+        return $ mpiVersion mpi == version

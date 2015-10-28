@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -35,7 +36,6 @@ import           Data.List (stripPrefix)
 import           Data.Hashable (Hashable)
 import           Data.Map (Map)
 import qualified Data.Map as Map
-
 import qualified Data.Map.Strict as M
 import           Data.Maybe
 import           Data.Monoid
@@ -61,6 +61,10 @@ import           Stack.Types.PackageIdentifier
 import           Stack.Types.PackageName
 import           Stack.Types.Version
 import           System.Process.Read (EnvOverride)
+#ifdef mingw32_HOST_OS
+import qualified Crypto.Hash.SHA1 as SHA1
+import qualified Data.ByteString.Base16 as B16
+#endif
 
 -- | The top-level Stackage configuration.
 data Config =
@@ -151,6 +155,9 @@ data Config =
          -- ^ Rebuild on GHC options changes
          ,configApplyGhcOptions     :: !ApplyGhcOptions
          -- ^ Which packages to ghc-options on the command line apply to?
+         ,configAllowNewer          :: !Bool
+         -- ^ Ignore version ranges in .cabal files. Funny naming chosen to
+         -- match cabal.
          }
 
 -- | Which packages to ghc-options on the command line apply to?
@@ -236,13 +243,18 @@ data EnvSettings = EnvSettings
     deriving (Show, Eq, Ord)
 
 data ExecOpts = ExecOpts
-    { eoCmd :: !(Maybe String)
-    -- ^ Usage of @Maybe@ here is nothing more than a hack, to avoid some weird
-    -- bug in optparse-applicative. See:
+    { eoCmd :: !(Maybe SpecialExecCmd)
+    -- ^ When 'Nothing', then the program to run is the head of
+    -- 'eoArgs'. See:
     -- https://github.com/commercialhaskell/stack/issues/806
     , eoArgs :: ![String]
     , eoExtra :: !ExecOptsExtra
-    }
+    } deriving (Show)
+
+data SpecialExecCmd
+    = ExecGhc
+    | ExecRunGhc
+    deriving (Show, Eq)
 
 data ExecOptsExtra
     = ExecOptsPlain
@@ -250,11 +262,12 @@ data ExecOptsExtra
         { eoEnvSettings :: !EnvSettings
         , eoPackages :: ![String]
         }
+    deriving (Show)
 
 data EvalOpts = EvalOpts
     { evalArg :: !String
     , evalExtra :: !ExecOptsExtra
-    }
+    } deriving (Show)
 
 -- | Parsed global command-line options.
 data GlobalOpts = GlobalOpts
@@ -262,6 +275,7 @@ data GlobalOpts = GlobalOpts
     , globalLogLevel     :: !LogLevel -- ^ Log level
     , globalConfigMonoid :: !ConfigMonoid -- ^ Config monoid, for passing into 'loadConfig'
     , globalResolver     :: !(Maybe AbstractResolver) -- ^ Resolver override
+    , globalCompiler     :: !(Maybe CompilerVersion) -- ^ Compiler override
     , globalTerminal     :: !Bool -- ^ We're in a terminal?
     , globalStackYaml    :: !(Maybe FilePath) -- ^ Override project stack.yaml
     } deriving (Show)
@@ -343,7 +357,7 @@ instance HasEnvConfig EnvConfig where
 data LoadConfig m = LoadConfig
     { lcConfig          :: !Config
       -- ^ Top-level Stack configuration.
-    , lcLoadBuildConfig :: !(Maybe AbstractResolver -> m BuildConfig)
+    , lcLoadBuildConfig :: !(Maybe AbstractResolver -> Maybe CompilerVersion -> m BuildConfig)
         -- ^ Action to load the remaining 'BuildConfig'.
     , lcProjectRoot     :: !(Maybe (Path Abs Dir))
         -- ^ The project root directory, if in a project.
@@ -435,12 +449,15 @@ data Project = Project
     -- ^ Per-package flag overrides
     , projectResolver :: !Resolver
     -- ^ How we resolve which dependencies to use
+    , projectCompiler :: !(Maybe CompilerVersion)
+    -- ^ When specified, overrides which compiler to use
     , projectExtraPackageDBs :: ![FilePath]
     }
   deriving Show
 
 instance ToJSON Project where
-    toJSON p = object
+    toJSON p = object $
+        (maybe id (\cv -> (("compiler" .= cv) :)) (projectCompiler p))
         [ "packages"          .= projectPackages p
         , "extra-deps"        .= map fromTuple (Map.toList $ projectExtraDeps p)
         , "flags"             .= projectFlags p
@@ -605,6 +622,9 @@ data ConfigMonoid =
     ,configMonoidRebuildGhcOptions   :: !(Maybe Bool)
     -- ^ See 'configMonoidRebuildGhcOptions'
     ,configMonoidApplyGhcOptions     :: !(Maybe ApplyGhcOptions)
+    -- ^ See 'configApplyGhcOptions'
+    ,configMonoidAllowNewer          :: !(Maybe Bool)
+    -- ^ See 'configMonoidAllowNewer'
     }
   deriving Show
 
@@ -640,6 +660,7 @@ instance Monoid ConfigMonoid where
     , configMonoidExplicitSetupDeps = mempty
     , configMonoidRebuildGhcOptions = Nothing
     , configMonoidApplyGhcOptions = Nothing
+    , configMonoidAllowNewer = Nothing
     }
   mappend l r = ConfigMonoid
     { configMonoidDockerOpts = configMonoidDockerOpts l <> configMonoidDockerOpts r
@@ -673,6 +694,7 @@ instance Monoid ConfigMonoid where
     , configMonoidExplicitSetupDeps = configMonoidExplicitSetupDeps l <> configMonoidExplicitSetupDeps r
     , configMonoidRebuildGhcOptions = configMonoidRebuildGhcOptions l <|> configMonoidRebuildGhcOptions r
     , configMonoidApplyGhcOptions = configMonoidApplyGhcOptions l <|> configMonoidApplyGhcOptions r
+    , configMonoidAllowNewer = configMonoidAllowNewer l <|> configMonoidAllowNewer r
     }
 
 instance FromJSON (ConfigMonoid, [JSONWarning]) where
@@ -683,57 +705,57 @@ instance FromJSON (ConfigMonoid, [JSONWarning]) where
 -- warnings for missing fields.
 parseConfigMonoidJSON :: Object -> WarningParser ConfigMonoid
 parseConfigMonoidJSON obj = do
-    configMonoidDockerOpts <- jsonSubWarnings (obj ..:? "docker" ..!= mempty)
-    configMonoidConnectionCount <- obj ..:? "connection-count"
-    configMonoidHideTHLoading <- obj ..:? "hide-th-loading"
-    configMonoidLatestSnapshotUrl <- obj ..:? "latest-snapshot-url"
-    configMonoidPackageIndices <- jsonSubWarningsTT (obj ..:? "package-indices")
-    configMonoidSystemGHC <- obj ..:? "system-ghc"
-    configMonoidInstallGHC <- obj ..:? "install-ghc"
-    configMonoidSkipGHCCheck <- obj ..:? "skip-ghc-check"
-    configMonoidSkipMsys <- obj ..:? "skip-msys"
+    configMonoidDockerOpts <- jsonSubWarnings (obj ..:? configMonoidDockerOptsName ..!= mempty)
+    configMonoidConnectionCount <- obj ..:? configMonoidConnectionCountName
+    configMonoidHideTHLoading <- obj ..:? configMonoidHideTHLoadingName
+    configMonoidLatestSnapshotUrl <- obj ..:? configMonoidLatestSnapshotUrlName
+    configMonoidPackageIndices <- jsonSubWarningsTT (obj ..:?  configMonoidPackageIndicesName)
+    configMonoidSystemGHC <- obj ..:? configMonoidSystemGHCName
+    configMonoidInstallGHC <- obj ..:? configMonoidInstallGHCName
+    configMonoidSkipGHCCheck <- obj ..:? configMonoidSkipGHCCheckName
+    configMonoidSkipMsys <- obj ..:? configMonoidSkipMsysName
     configMonoidRequireStackVersion <- unVersionRangeJSON <$>
-                                       obj ..:? "require-stack-version"
+                                       obj ..:? configMonoidRequireStackVersionName
                                            ..!= VersionRangeJSON anyVersion
-    configMonoidOS <- obj ..:? "os"
-    configMonoidArch <- obj ..:? "arch"
-    configMonoidGHCVariant <- obj ..:? "ghc-variant"
-    configMonoidJobs <- obj ..:? "jobs"
-    configMonoidExtraIncludeDirs <- obj ..:? "extra-include-dirs" ..!= Set.empty
-    configMonoidExtraLibDirs <- obj ..:? "extra-lib-dirs" ..!= Set.empty
-    configMonoidConcurrentTests <- obj ..:? "concurrent-tests"
-    configMonoidLocalBinPath <- obj ..:? "local-bin-path"
-    configMonoidImageOpts <- jsonSubWarnings (obj ..:? "image" ..!= mempty)
+    configMonoidOS <- obj ..:? configMonoidOSName
+    configMonoidArch <- obj ..:? configMonoidArchName
+    configMonoidGHCVariant <- obj ..:? configMonoidGHCVariantName
+    configMonoidJobs <- obj ..:? configMonoidJobsName
+    configMonoidExtraIncludeDirs <- obj ..:?  configMonoidExtraIncludeDirsName ..!= Set.empty
+    configMonoidExtraLibDirs <- obj ..:?  configMonoidExtraLibDirsName ..!= Set.empty
+    configMonoidConcurrentTests <- obj ..:? configMonoidConcurrentTestsName
+    configMonoidLocalBinPath <- obj ..:? configMonoidLocalBinPathName
+    configMonoidImageOpts <- jsonSubWarnings (obj ..:?  configMonoidImageOptsName ..!= mempty)
     templates <- obj ..:? "templates"
     (configMonoidScmInit,configMonoidTemplateParameters) <-
       case templates of
         Nothing -> return (Nothing,M.empty)
         Just tobj -> do
-          scmInit <- tobj ..:? "scm-init"
-          params <- tobj ..:? "params"
+          scmInit <- tobj ..:? configMonoidScmInitName
+          params <- tobj ..:? configMonoidTemplateParametersName
           return (scmInit,fromMaybe M.empty params)
-    configMonoidCompilerCheck <- obj ..:? "compiler-check"
+    configMonoidCompilerCheck <- obj ..:? configMonoidCompilerCheckName
 
-    mghcoptions <- obj ..:? "ghc-options"
+    mghcoptions <- obj ..:? configMonoidGhcOptionsName
     configMonoidGhcOptions <-
         case mghcoptions of
             Nothing -> return mempty
             Just m -> fmap Map.fromList $ mapM handleGhcOptions $ Map.toList m
 
-    extraPath <- obj ..:? "extra-path" ..!= []
+    extraPath <- obj ..:? configMonoidExtraPathName ..!= []
     configMonoidExtraPath <- forM extraPath $
         either (fail . show) return . parseAbsDir . T.unpack
 
     configMonoidSetupInfoLocations <-
-        maybeToList <$> jsonSubWarningsT (obj ..:? "setup-info")
-
-    configMonoidPvpBounds <- obj ..:? "pvp-bounds"
-    configMonoidModifyCodePage <- obj ..:? "modify-code-page"
+        maybeToList <$> jsonSubWarningsT (obj ..:?  configMonoidSetupInfoLocationsName)
+    configMonoidPvpBounds <- obj ..:? configMonoidPvpBoundsName
+    configMonoidModifyCodePage <- obj ..:? configMonoidModifyCodePageName
     configMonoidExplicitSetupDeps <-
-        (obj ..:? "explicit-setup-deps" ..!= mempty)
+        (obj ..:? configMonoidExplicitSetupDepsName ..!= mempty)
         >>= fmap Map.fromList . mapM handleExplicitSetupDep . Map.toList
-    configMonoidRebuildGhcOptions <- obj ..:? "rebuild-ghc-options"
-    configMonoidApplyGhcOptions <- obj ..:? "apply-ghc-options"
+    configMonoidRebuildGhcOptions <- obj ..:? configMonoidRebuildGhcOptionsName
+    configMonoidApplyGhcOptions <- obj ..:? configMonoidApplyGhcOptionsName
+    configMonoidAllowNewer <- obj ..:? configMonoidAllowNewerName
 
     return ConfigMonoid {..}
   where
@@ -759,6 +781,102 @@ parseConfigMonoidJSON obj = do
                         Left e -> fail $ show e
                         Right x -> return $ Just x
         return (name, b)
+
+configMonoidDockerOptsName :: Text
+configMonoidDockerOptsName = "docker"
+
+configMonoidConnectionCountName :: Text
+configMonoidConnectionCountName = "connection-count"
+
+configMonoidHideTHLoadingName :: Text
+configMonoidHideTHLoadingName = "hide-th-loading"
+
+configMonoidLatestSnapshotUrlName :: Text
+configMonoidLatestSnapshotUrlName = "latest-snapshot-url"
+
+configMonoidPackageIndicesName :: Text
+configMonoidPackageIndicesName = "package-indices"
+
+configMonoidSystemGHCName :: Text
+configMonoidSystemGHCName = "system-ghc"
+
+configMonoidInstallGHCName :: Text
+configMonoidInstallGHCName = "install-ghc"
+
+configMonoidSkipGHCCheckName :: Text
+configMonoidSkipGHCCheckName = "skip-ghc-check"
+
+configMonoidSkipMsysName :: Text
+configMonoidSkipMsysName = "skip-msys"
+
+configMonoidRequireStackVersionName :: Text
+configMonoidRequireStackVersionName = "require-stack-version"
+
+configMonoidOSName :: Text
+configMonoidOSName = "os"
+
+configMonoidArchName :: Text
+configMonoidArchName = "arch"
+
+configMonoidGHCVariantName :: Text
+configMonoidGHCVariantName = "ghc-variant"
+
+configMonoidJobsName :: Text
+configMonoidJobsName = "jobs"
+
+configMonoidExtraIncludeDirsName :: Text
+configMonoidExtraIncludeDirsName = "extra-include-dirs"
+
+configMonoidExtraLibDirsName :: Text
+configMonoidExtraLibDirsName = "extra-lib-dirs"
+
+configMonoidConcurrentTestsName :: Text
+configMonoidConcurrentTestsName = "concurrent-tests"
+
+configMonoidLocalBinPathName :: Text
+configMonoidLocalBinPathName = "local-bin-path"
+
+configMonoidImageOptsName :: Text
+configMonoidImageOptsName = "image"
+
+configMonoidTemplatesName :: Text
+configMonoidTemplatesName = "templates"
+
+configMonoidScmInitName :: Text
+configMonoidScmInitName = "scm-init"
+
+configMonoidTemplateParametersName :: Text
+configMonoidTemplateParametersName = "params"
+
+configMonoidCompilerCheckName :: Text
+configMonoidCompilerCheckName = "compiler-check"
+
+configMonoidGhcOptionsName :: Text
+configMonoidGhcOptionsName = "ghc-options"
+
+configMonoidExtraPathName :: Text
+configMonoidExtraPathName = "extra-path"
+
+configMonoidSetupInfoLocationsName :: Text
+configMonoidSetupInfoLocationsName = "setup-info"
+
+configMonoidPvpBoundsName :: Text
+configMonoidPvpBoundsName = "pvp-bounds"
+
+configMonoidModifyCodePageName :: Text
+configMonoidModifyCodePageName = "modify-code-page"
+
+configMonoidExplicitSetupDepsName :: Text
+configMonoidExplicitSetupDepsName = "explicit-setup-deps"
+
+configMonoidRebuildGhcOptionsName :: Text
+configMonoidRebuildGhcOptionsName = "rebuild-ghc-options"
+
+configMonoidApplyGhcOptionsName :: Text
+configMonoidApplyGhcOptionsName = "apply-ghc-options"
+
+configMonoidAllowNewerName :: Text
+configMonoidAllowNewerName = "allow-newer"
 
 -- | Newtype for non-orphan FromJSON instance.
 newtype VersionRangeJSON = VersionRangeJSON { unVersionRangeJSON :: VersionRange }
@@ -895,15 +1013,6 @@ platformOnlyRelDir = do
     platform <- asks getPlatform
     parseRelDir (Distribution.Text.display platform)
 
--- | Relative directory for the platform identifier
-platformVariantRelDir
-    :: (MonadReader env m, HasPlatform env, HasGHCVariant env, MonadThrow m)
-    => m (Path Rel Dir)
-platformVariantRelDir = do
-    platform <- asks getPlatform
-    ghcVariant <- asks getGHCVariant
-    parseRelDir (Distribution.Text.display platform <> ghcVariantSuffix ghcVariant)
-
 -- | Path to .shake files.
 configShakeFilesDir :: (MonadReader env m, HasBuildConfig env) => m (Path Abs Dir)
 configShakeFilesDir = liftM (</> $(mkRelDir "shake")) configProjectWorkDir
@@ -922,20 +1031,50 @@ snapshotsDir = do
 -- | Installation root for dependencies
 installationRootDeps :: (MonadThrow m, MonadReader env m, HasEnvConfig env) => m (Path Abs Dir)
 installationRootDeps = do
-    snapshots <- snapshotsDir
-    bc <- asks getBuildConfig
-    name <- parseRelDir $ T.unpack $ resolverName $ bcResolver bc
-    ghc <- compilerVersionDir
-    return $ snapshots </> name </> ghc
+    config <- asks getConfig
+    -- TODO: also useShaPathOnWindows here, once #1173 is resolved.
+    psc <- platformSnapAndCompilerRel
+    return $ configStackRoot config </> $(mkRelDir "snapshots") </> psc
 
 -- | Installation root for locals
 installationRootLocal :: (MonadThrow m, MonadReader env m, HasEnvConfig env) => m (Path Abs Dir)
 installationRootLocal = do
     bc <- asks getBuildConfig
+    psc <- useShaPathOnWindows =<< platformSnapAndCompilerRel
+    return $ configProjectWorkDir bc </> $(mkRelDir "install") </> psc
+
+-- | Path for platform followed by snapshot name followed by compiler
+-- name.
+platformSnapAndCompilerRel
+    :: (MonadReader env m, HasPlatform env, HasEnvConfig env, MonadThrow m)
+    => m (Path Rel Dir)
+platformSnapAndCompilerRel = do
+    bc <- asks getBuildConfig
+    platform <- platformVariantRelDir
     name <- parseRelDir $ T.unpack $ resolverName $ bcResolver bc
     ghc <- compilerVersionDir
-    platform <- platformVariantRelDir
-    return $ configProjectWorkDir bc </> $(mkRelDir "install") </> platform </> name </> ghc
+    useShaPathOnWindows (platform </> name </> ghc)
+
+-- | Relative directory for the platform identifier
+platformVariantRelDir
+    :: (MonadReader env m, HasPlatform env, HasGHCVariant env, MonadThrow m)
+    => m (Path Rel Dir)
+platformVariantRelDir = do
+    platform <- asks getPlatform
+    ghcVariant <- asks getGHCVariant
+    parseRelDir (Distribution.Text.display platform <> ghcVariantSuffix ghcVariant)
+
+-- | This is an attempt to shorten stack paths on Windows to decrease our
+-- chances of hitting 260 symbol path limit. The idea is to calculate
+-- SHA1 hash of the path used on other architectures, encode with base
+-- 16 and take first 8 symbols of it.
+useShaPathOnWindows :: MonadThrow m => Path Rel Dir -> m (Path Rel Dir)
+useShaPathOnWindows =
+#ifdef mingw32_HOST_OS
+    parseRelDir . S8.unpack . S8.take 8 . B16.encode . SHA1.hash . encodeUtf8 . T.pack . toFilePath
+#else
+    return
+#endif
 
 compilerVersionDir :: (MonadThrow m, MonadReader env m, HasEnvConfig env) => m (Path Rel Dir)
 compilerVersionDir = do
@@ -1039,6 +1178,7 @@ instance (warnings ~ [JSONWarning]) => FromJSON (ProjectAndConfigMonoid, warning
 
         flags <- o ..:? "flags" ..!= mempty
         resolver <- jsonSubWarnings (o ..: "resolver")
+        compiler <- o ..:? "compiler"
         config <- parseConfigMonoidJSON o
         extraPackageDBs <- o ..:? "extra-package-dbs" ..!= []
         let project = Project
@@ -1046,6 +1186,7 @@ instance (warnings ~ [JSONWarning]) => FromJSON (ProjectAndConfigMonoid, warning
                 , projectExtraDeps = extraDeps
                 , projectFlags = flags
                 , projectResolver = resolver
+                , projectCompiler = compiler
                 , projectExtraPackageDBs = extraPackageDBs
                 }
         return $ ProjectAndConfigMonoid project config

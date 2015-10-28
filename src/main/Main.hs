@@ -33,9 +33,9 @@ import qualified Data.Text.IO as T
 import           Data.Traversable
 import           Data.Typeable (Typeable)
 import           Data.Version (showVersion)
+import           Development.GitRev (gitCommitCount)
 import           Distribution.System (buildArch)
 import           Distribution.Text (display)
-import           Development.GitRev (gitCommitCount)
 import           GHC.IO.Encoding (mkTextEncoding, textEncodingName)
 import           Network.HTTP.Client
 import           Options.Applicative.Args
@@ -43,18 +43,22 @@ import           Options.Applicative.Builder.Extra
 import           Options.Applicative.Simple
 import           Options.Applicative.Types (readerAsk)
 import           Path
+import           Path.Extra (toFilePathNoTrailingSep)
 import           Path.IO
 import qualified Paths_stack as Meta
 import           Prelude hiding (pi, mapM)
 import           Stack.Build
-import           Stack.Types.Build
 import           Stack.Config
+import           Stack.ConfigCmd as ConfigCmd
 import           Stack.Constants
+import           Stack.Coverage
 import qualified Stack.Docker as Docker
 import           Stack.Dot
 import           Stack.Exec
 import           Stack.Fetch
 import           Stack.FileWatch
+import           Stack.GhcPkg (getGlobalDB, mkGhcPackagePath)
+import           Stack.Ghci
 import           Stack.Ide
 import qualified Stack.Image as Image
 import           Stack.Init
@@ -62,8 +66,6 @@ import           Stack.New
 import           Stack.Options
 import           Stack.Package (getCabalFileName)
 import qualified Stack.PackageIndex
-import           Stack.Ghci
-import           Stack.GhcPkg (getGlobalDB, mkGhcPackagePath)
 import           Stack.SDist (getSDistTarball)
 import           Stack.Setup
 import qualified Stack.Sig as Sig
@@ -77,7 +79,7 @@ import           System.Directory (canonicalizePath, doesFileExist, doesDirector
 import           System.Environment (getEnvironment, getProgName)
 import           System.Exit
 import           System.FileLock (lockFile, tryLockFile, unlockFile, SharedExclusive(Exclusive), FileLock)
-import           System.FilePath (dropTrailingPathSeparator, searchPathSeparator)
+import           System.FilePath (searchPathSeparator)
 import           System.IO (hIsTerminalDevice, stderr, stdin, stdout, hSetBuffering, BufferMode(..), hPutStrLn, Handle, hGetEncoding, hSetEncoding)
 import           System.Process.Read
 
@@ -109,12 +111,13 @@ main = withInterpreterArgs stackProgName $ \args isInterpreter -> do
                    dockerHelpOptName
                    (dockerOptsParser True)
                    ("Only showing --" ++ Docker.dockerCmdName ++ "* options.")
-     let versionString' = concat $ concat
+     let commitCount = $gitCommitCount
+         versionString' = concat $ concat
             [ [$(simpleVersion Meta.version)]
               -- Leave out number of commits for --depth=1 clone
               -- See https://github.com/commercialhaskell/stack/issues/792
-            , [" (" ++ $gitCommitCount ++ " commits)" | $gitCommitCount /= ("1"::String) &&
-                                                        $gitCommitCount /= ("UNKNOWN" :: String)]
+            , [" (" ++ commitCount ++ " commits)" | commitCount /= ("1"::String) &&
+                                                    commitCount /= ("UNKNOWN" :: String)]
             , [" ", display buildArch]
             ]
 
@@ -236,7 +239,7 @@ main = withInterpreterArgs stackProgName $ \args isInterpreter -> do
              addCommand "ghc"
                         "Run ghc"
                         execCmd
-                        (execOptsParser $ Just "ghc")
+                        (execOptsParser $ Just ExecGhc)
              addCommand "ghci"
                         "Run ghci in the context of project(s) (experimental)"
                         ghciCmd
@@ -244,11 +247,11 @@ main = withInterpreterArgs stackProgName $ \args isInterpreter -> do
              addCommand "runghc"
                         "Run runghc"
                         execCmd
-                        (execOptsParser $ Just "runghc")
+                        (execOptsParser $ Just ExecRunGhc)
              addCommand "eval"
                         "Evaluate some haskell code inline. Shortcut for 'stack exec ghc -- -e CODE'"
                         evalCmd
-                        (evalOptsParser $ Just "CODE") -- metavar = "CODE"
+                        (evalOptsParser "CODE")
              addCommand "clean"
                         "Clean the local packages"
                         cleanCmd
@@ -302,19 +305,36 @@ main = withInterpreterArgs stackProgName $ \args isInterpreter -> do
                    addCommand "reset"
                               "Reset the Docker sandbox"
                               dockerResetCmd
-                              (flag False True (long "keep-home" <>
-                                               help "Do not delete sandbox's home directory"))
+                              (switch (long "keep-home" <>
+                                       help "Do not delete sandbox's home directory"))
                    addCommand Docker.dockerCleanupCmdName
                               "Clean up Docker images and containers"
                               dockerCleanupCmd
                               dockerCleanupOptsParser)
+             addSubCommands
+                ConfigCmd.cfgCmdName
+                "Subcommands specific to modifying stack.yaml files"
+                (addCommand ConfigCmd.cfgCmdSetName
+                            "Sets a field in the project's stack.yaml to value"
+                            cfgSetCmd
+                            configCmdSetParser)
              addSubCommands
                Image.imgCmdName
                "Subcommands specific to imaging (EXPERIMENTAL)"
                (addCommand Image.imgDockerCmdName
                 "Build a Docker image for the project"
                 imgDockerCmd
-                (pure ()))
+                (boolFlags True
+                    "build"
+                    "building the project before creating the container"
+                    idm))
+             addSubCommands
+               "hpc"
+               "Subcommands specific to Haskell Program Coverage"
+               (do addCommand "report"
+                              "Generate HPC report a combined HPC report"
+                              hpcReportCmd
+                              hpcReportOptsParser)
              addSubCommands
                Sig.sigCmdName
                "Subcommands specific to package signatures (EXPERIMENTAL)"
@@ -418,15 +438,15 @@ paths =
     [ ( "Global stack root directory"
       , "global-stack-root"
       , \pi ->
-             T.pack (toFilePathNoTrailing (configStackRoot (bcConfig (piBuildConfig pi)))))
+             T.pack (toFilePathNoTrailingSep (configStackRoot (bcConfig (piBuildConfig pi)))))
     , ( "Project root (derived from stack.yaml file)"
       , "project-root"
       , \pi ->
-             T.pack (toFilePathNoTrailing (bcRoot (piBuildConfig pi))))
+             T.pack (toFilePathNoTrailingSep (bcRoot (piBuildConfig pi))))
     , ( "Configuration location (where the stack.yaml file is)"
       , "config-location"
       , \pi ->
-             T.pack (toFilePathNoTrailing (bcStackYaml (piBuildConfig pi))))
+             T.pack (toFilePath (bcStackYaml (piBuildConfig pi))))
     , ( "PATH environment variable"
       , "bin-path"
       , \pi ->
@@ -434,11 +454,11 @@ paths =
     , ( "Installed GHCs (unpacked and archives)"
       , "ghc-paths"
       , \pi ->
-             T.pack (toFilePathNoTrailing (configLocalPrograms (bcConfig (piBuildConfig pi)))))
+             T.pack (toFilePathNoTrailingSep (configLocalPrograms (bcConfig (piBuildConfig pi)))))
     , ( "Local bin path where stack installs executables"
       , "local-bin-path"
       , \pi ->
-             T.pack (toFilePathNoTrailing (configLocalBin (bcConfig (piBuildConfig pi)))))
+             T.pack (toFilePathNoTrailingSep (configLocalBin (bcConfig (piBuildConfig pi)))))
     , ( "Extra include directories"
       , "extra-include-dirs"
       , \pi ->
@@ -452,39 +472,38 @@ paths =
     , ( "Snapshot package database"
       , "snapshot-pkg-db"
       , \pi ->
-             T.pack (toFilePathNoTrailing (piSnapDb pi)))
+             T.pack (toFilePathNoTrailingSep (piSnapDb pi)))
     , ( "Local project package database"
       , "local-pkg-db"
       , \pi ->
-             T.pack (toFilePathNoTrailing (piLocalDb pi)))
+             T.pack (toFilePathNoTrailingSep (piLocalDb pi)))
     , ( "Global package database"
       , "global-pkg-db"
       , \pi ->
-             T.pack (toFilePathNoTrailing (piGlobalDb pi)))
+             T.pack (toFilePathNoTrailingSep (piGlobalDb pi)))
     , ( "GHC_PACKAGE_PATH environment variable"
       , "ghc-package-path"
       , \pi -> mkGhcPackagePath True (piLocalDb pi) (piSnapDb pi) (piGlobalDb pi))
     , ( "Snapshot installation root"
       , "snapshot-install-root"
       , \pi ->
-             T.pack (toFilePathNoTrailing (piSnapRoot pi)))
+             T.pack (toFilePathNoTrailingSep (piSnapRoot pi)))
     , ( "Local project installation root"
       , "local-install-root"
       , \pi ->
-             T.pack (toFilePathNoTrailing (piLocalRoot pi)))
+             T.pack (toFilePathNoTrailingSep (piLocalRoot pi)))
     , ( "Snapshot documentation root"
       , "snapshot-doc-root"
       , \pi ->
-             T.pack (toFilePathNoTrailing (piSnapRoot pi </> docDirSuffix)))
+             T.pack (toFilePathNoTrailingSep (piSnapRoot pi </> docDirSuffix)))
     , ( "Local project documentation root"
       , "local-doc-root"
       , \pi ->
-             T.pack (toFilePathNoTrailing (piLocalRoot pi </> docDirSuffix)))
+             T.pack (toFilePathNoTrailingSep (piLocalRoot pi </> docDirSuffix)))
     , ( "Dist work directory"
       , "dist-dir"
       , \pi ->
-             T.pack (toFilePathNoTrailing (piDistDir pi)))]
-  where toFilePathNoTrailing = dropTrailingPathSeparator . toFilePath
+             T.pack (toFilePathNoTrailingSep (piDistDir pi)))]
 
 data SetupCmdOpts = SetupCmdOpts
     { scoCompilerVersion :: !(Maybe CompilerVersion)
@@ -542,7 +561,7 @@ setupCmd SetupCmdOpts{..} go@GlobalOpts{..} = do
                   case scoCompilerVersion of
                       Just v -> return (v, MatchMinor, Nothing)
                       Nothing -> do
-                          bc <- lcLoadBuildConfig lc globalResolver
+                          bc <- lcLoadBuildConfig lc globalResolver globalCompiler
                           return ( bcWantedCompiler bc
                                  , configCompilerCheck (lcConfig lc)
                                  , Just $ bcStackYaml bc
@@ -687,7 +706,7 @@ withBuildConfigExt go@GlobalOpts{..} mbefore inner mafter = do
 
       let inner'' lk = do
               bconfig <- runStackLoggingTGlobal manager go $
-                  lcLoadBuildConfig lc globalResolver
+                  lcLoadBuildConfig lc globalResolver globalCompiler
               envConfig <-
                  runStackTGlobal
                      manager bconfig go
@@ -716,18 +735,12 @@ buildCmd opts go = do
     hPutStrLn stderr "See: https://github.com/commercialhaskell/stack/issues/1015"
     error "-prof GHC option submitted"
   case boptsFileWatch opts of
-    FileWatchPoll -> fileWatchPoll getProjectRoot inner
-    FileWatch -> fileWatch getProjectRoot inner
+    FileWatchPoll -> fileWatchPoll inner
+    FileWatch -> fileWatch inner
     NoFileWatch -> inner $ const $ return ()
   where
     inner setLocalFiles = withBuildConfigAndLock go $ \lk ->
         Stack.Build.build setLocalFiles lk opts
-    getProjectRoot = do
-        (manager, lc) <- loadConfigWithOpts go
-        bconfig <-
-            runStackLoggingTGlobal manager go $
-            lcLoadBuildConfig lc (globalResolver go)
-        return (bcRoot bconfig)
 
 uninstallCmd :: [String] -> GlobalOpts -> IO ()
 uninstallCmd _ go = withConfigAndLock go $ do
@@ -807,13 +820,14 @@ sdistCmd (dirs, mpvpBounds) go =
 -- | Execute a command.
 execCmd :: ExecOpts -> GlobalOpts -> IO ()
 execCmd ExecOpts {..} go@GlobalOpts{..} = do
-    (cmd, args) <-
-        case (eoCmd, eoArgs) of
-            (Just cmd, args) -> return (cmd, args)
-            (Nothing, cmd:args) -> return (cmd, args)
-            (Nothing, []) -> error "You must provide a command to exec, e.g. 'stack exec echo Hello World'"
+    let needCmdErr = error "You must provide a command to exec, e.g. 'stack exec echo Hello World'"
     case eoExtra of
         ExecOptsPlain -> do
+            (cmd, args) <- case (eoCmd, eoArgs) of
+                 (Just ExecGhc, args) -> return ("ghc", args)
+                 (Just ExecRunGhc, args) -> return ("runghc", args)
+                 (Nothing, cmd:args) -> return (cmd, args)
+                 (Nothing, []) -> needCmdErr
             (manager,lc) <- liftIO $ loadConfigWithOpts go
             withUserFileLock go (configStackRoot $ lcConfig lc) $ \lk ->
              runStackTGlobal manager (lcConfig lc) go $
@@ -828,6 +842,17 @@ execCmd ExecOpts {..} go@GlobalOpts{..} = do
                     Nothing -- Unlocked already above.
         ExecOptsEmbellished {..} ->
            withBuildConfigAndLock go $ \lk -> do
+               (cmd, args) <- case (eoCmd, eoArgs) of
+                   (Nothing, cmd:args) -> return (cmd, args)
+                   (Nothing, []) -> needCmdErr
+                   (Just scmd, args) -> do
+                       wc <- getWhichCompiler
+                       let cmd = case scmd of
+                               ExecGhc -> compilerExeName wc
+                               -- NOTE: this won't currently work for GHCJS, because it doesn't have
+                               -- a runghcjs binary. It probably will someday, though.
+                               ExecRunGhc -> "run" ++ compilerExeName wc
+                       return (cmd, args)
                let targets = concatMap words eoPackages
                unless (null targets) $
                    Stack.Build.build (const $ return ()) lk defaultBuildOpts
@@ -841,7 +866,7 @@ evalCmd :: EvalOpts -> GlobalOpts -> IO ()
 evalCmd EvalOpts {..} go@GlobalOpts {..} = execCmd execOpts go
     where
       execOpts =
-          ExecOpts { eoCmd = Just "ghc"
+          ExecOpts { eoCmd = Just ExecGhc
                    , eoArgs = ["-e", evalArg]
                    , eoExtra = evalExtra
                    }
@@ -916,13 +941,22 @@ dockerCleanupCmd cleanupOpts go@GlobalOpts{..} = do
         Docker.preventInContainer $
             Docker.cleanup cleanupOpts
 
-imgDockerCmd :: () -> GlobalOpts -> IO ()
-imgDockerCmd () go@GlobalOpts{..} = do
+cfgSetCmd :: ConfigCmd.ConfigCmdSet -> GlobalOpts -> IO ()
+cfgSetCmd co go@GlobalOpts{..} = do
+    withBuildConfigAndLock
+        go
+        (\_ -> do env <- ask
+                  runReaderT
+                      (cfgCmdSet co)
+                      env)
+
+imgDockerCmd :: Bool -> GlobalOpts -> IO ()
+imgDockerCmd rebuild go@GlobalOpts{..} = do
     withBuildConfigExt
         go
         Nothing
         (\lk ->
-              do Stack.Build.build
+              do when rebuild $ Stack.Build.build
                          (const (return ()))
                          lk
                          defaultBuildOpts
@@ -994,6 +1028,10 @@ listDependenciesCmd sep go = withBuildConfig go (listDependencies sep')
 -- | Query build information
 queryCmd :: [String] -> GlobalOpts -> IO ()
 queryCmd selectors go = withBuildConfig go $ queryBuildInfo $ map T.pack selectors
+
+-- | Generate a combined HPC report
+hpcReportCmd :: HpcReportOpts -> GlobalOpts -> IO ()
+hpcReportCmd hropts go = withBuildConfig go $ generateHpcReportForTargets hropts
 
 data MainException = InvalidReExecVersion String String
      deriving (Typeable)

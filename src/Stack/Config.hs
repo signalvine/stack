@@ -191,6 +191,7 @@ configFromConfigMonoid configStackRoot configUserConfigPath mproject configMonoi
          configExplicitSetupDeps = configMonoidExplicitSetupDeps
          configRebuildGhcOptions = fromMaybe False configMonoidRebuildGhcOptions
          configApplyGhcOptions = fromMaybe AGOLocals configMonoidApplyGhcOptions
+         configAllowNewer = fromMaybe False configMonoidAllowNewer
 
      return Config {..}
 
@@ -268,7 +269,13 @@ loadConfig :: (MonadLogger m,MonadIO m,MonadCatch m,MonadThrow m,MonadBaseContro
 loadConfig configArgs mstackYaml = do
     stackRoot <- determineStackRoot
     userConfigPath <- getDefaultUserConfigPath stackRoot
-    extraConfigs <- getExtraConfigs userConfigPath >>= mapM loadYaml
+    extraConfigs0 <- getExtraConfigs userConfigPath >>= mapM loadYaml
+    let extraConfigs =
+            -- non-project config files' existence of a docker section should never default docker
+            -- to enabled, so make it look like they didn't exist
+            map (\c -> c {configMonoidDockerOpts =
+                              (configMonoidDockerOpts c) {dockerMonoidDefaultEnable = False}})
+                extraConfigs0
     mproject <- loadProjectConfig mstackYaml
     config <- configFromConfigMonoid stackRoot userConfigPath (fmap (\(proj, _, _) -> proj) mproject) $ mconcat $
         case mproject of
@@ -288,8 +295,9 @@ loadBuildConfig :: (MonadLogger m, MonadIO m, MonadCatch m, MonadReader env m, H
                 => Maybe (Project, Path Abs File, ConfigMonoid)
                 -> Config
                 -> Maybe AbstractResolver -- override resolver
+                -> Maybe CompilerVersion -- override compiler
                 -> m BuildConfig
-loadBuildConfig mproject config mresolver = do
+loadBuildConfig mproject config mresolver mcompiler = do
     env <- ask
     miniConfig <- loadMiniConfig config
 
@@ -333,6 +341,7 @@ loadBuildConfig mproject config mresolver = do
                            , projectExtraDeps = mempty
                            , projectFlags = mempty
                            , projectResolver = r
+                           , projectCompiler = Nothing
                            , projectExtraPackageDBs = []
                            }
                    liftIO $ do
@@ -355,17 +364,22 @@ loadBuildConfig mproject config mresolver = do
             Nothing -> return $ projectResolver project'
             Just aresolver -> do
                 runReaderT (makeConcreteResolver aresolver) miniConfig
-    let project = project' { projectResolver = resolver }
+    let project = project'
+            { projectResolver = resolver
+            , projectCompiler = mcompiler <|> projectCompiler project'
+            }
 
     wantedCompiler <-
-        case projectResolver project of
-            ResolverSnapshot snapName -> do
-                mbp <- runReaderT (loadMiniBuildPlan snapName) miniConfig
-                return $ mbpCompilerVersion mbp
-            ResolverCustom _name url -> do
-                mbp <- runReaderT (parseCustomMiniBuildPlan stackYamlFP url) miniConfig
-                return $ mbpCompilerVersion mbp
-            ResolverCompiler wantedCompiler -> return wantedCompiler
+        case projectCompiler project of
+            Just wantedCompiler -> return wantedCompiler
+            Nothing -> case projectResolver project of
+                ResolverSnapshot snapName -> do
+                    mbp <- runReaderT (loadMiniBuildPlan snapName) miniConfig
+                    return $ mbpCompilerVersion mbp
+                ResolverCustom _name url -> do
+                    mbp <- runReaderT (parseCustomMiniBuildPlan stackYamlFP url) miniConfig
+                    return $ mbpCompilerVersion mbp
+                ResolverCompiler wantedCompiler -> return wantedCompiler
 
     extraPackageDBs <- mapM parseRelAsAbsDir (projectExtraPackageDBs project)
 

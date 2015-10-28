@@ -16,7 +16,6 @@ These must be installed in the PATH to use the release tool:
 
 - stack
 - git (for Windows, [msysgit](https://msysgit.github.io) is recommended).
-- cabal (cabal-install)
 
 To create a signed binary package, you need:
 
@@ -58,10 +57,21 @@ To create and upload Arch packages, you need:
 
 - [AWS CLI installed](http://docs.aws.amazon.com/cli/latest/userguide/installing.html).
 
+Building
+--------
+
+Ensure that `~/.local/bin` is in your PATH, then:
+
+    (cd etc/scripts && stack install)
+
+(note: do not use `stack exec stack-release-script`, because certain parts of
+the build do not work properly while in a `stack exec` context, especially on
+Windows)
+
 Invocation
 ----------
 
-Usage: `etc/scripts/release.hs [OPTIONS] TARGET`
+Usage: `stack-release-script [OPTIONS] TARGET`
 
 The tool must be run in the root of the working tree.
 

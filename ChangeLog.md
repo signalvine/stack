@@ -2,7 +2,28 @@
 
 Major changes:
 
-* "stack setup" now supports building and booting GHCJS from source tarball.
+* GHCJS can now be used with stackage snapshots.
+* Windows installers are now available:
+  [download them here](https://github.com/commercialhaskell/stack/blob/release/doc/install_and_upgrade.md#windows) [#613](https://github.com/commercialhaskell/stack/issues/613)
+
+Other enhancements:
+
+* Added an `allow-newer` config option [#922](https://github.com/commercialhaskell/stack/issues/922) [#770](https://github.com/commercialhaskell/stack/issues/770)
+* When a Hackage revision invalidates a build plan in a snapshot, trust the snapshot [#770](https://github.com/commercialhaskell/stack/issues/770)
+* Added a `stack config set resolver RESOLVER` command. Part of work on [#115](https://github.com/commercialhaskell/stack/issues/115)
+* `stack setup` can now install GHCJS on windows.  See [#1145](https://github.com/commercialhaskell/stack/issues/1145) and [#749](https://github.com/commercialhaskell/stack/issues/749)
+* `stack hpc report` command added, which generates reports for HPC tix files
+
+Bug fixes:
+
+* Haddocks not copied for dependencies [#1105](https://github.com/commercialhaskell/stack/issues/1105)
+* Rebuild when cabal file is changed
+
+## v0.1.6.0
+
+Major changes:
+
+* `stack setup` now supports building and booting GHCJS from source tarball.
 * On Windows, build directories no longer display "pretty" information
   (like x86_64-windows/Cabal-1.22.4.0), but rather a hash of that
   content. The reason is to avoid the 260 character path limitation on
@@ -31,6 +52,8 @@ Other enhancements:
 * Docker: when Docker Engine is remote, don't run containerized processes as host's UID/GID [#194](https://github.com/commercialhaskell/stack/issues/194)
 * Docker: `set-user` option to enable/disable running containerized processes as host's UID/GID [#194](https://github.com/commercialhaskell/stack/issues/194)
 * Custom Setup.hs files are now precompiled instead of interpreted. This should be a major performance win for certain edge cases (biggest example: [building Cabal itself](https://github.com/commercialhaskell/stack/issues/1041)) while being either neutral or a minor slowdown for more common cases.
+* `stack test --coverage` now also generates a unified coverage report for multiple test-suites / packages.  In the unified report, test-suites can contribute to the coverage of other packages.
+* --fast turns off optimizations
 
 Bug fixes:
 

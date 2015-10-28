@@ -14,6 +14,7 @@ import           Control.Monad.IO.Class
 import           Control.Monad.Logger
 import           Control.Monad.Reader
 import           Control.Monad.Trans.Resource
+import           Data.Either
 import           Data.Function
 import           Data.List
 import           Data.Map.Strict (Map)
@@ -28,6 +29,7 @@ import           Distribution.ModuleName (ModuleName)
 import           Distribution.Text (display)
 import           Network.HTTP.Client.Conduit
 import           Path
+import           Path.IO
 import           Prelude
 import           Stack.Build
 import           Stack.Build.Installed
@@ -38,6 +40,7 @@ import           Stack.Exec
 import           Stack.Package
 import           Stack.Types
 import           Stack.Types.Internal
+import           System.Directory (getTemporaryDirectory)
 
 -- | Command-line options for GHC.
 data GhciOpts = GhciOpts
@@ -72,10 +75,11 @@ ghci GhciOpts{..} = do
     mainFile <- figureOutMainFile mainIsTargets targets pkgs
     wc <- getWhichCompiler
     let pkgopts = concatMap ghciPkgOpts pkgs
-        srcfiles
+        modulesToLoad
           | ghciNoLoadModules = []
           | otherwise =
-              nub (maybe [] (return . toFilePath) mainFile <>
+              nub
+                  (maybe [] (return . toFilePath) mainFile <>
                    concatMap (map display . S.toList . ghciPkgModules) pkgs)
         odir =
             [ "-odir=" <> toFilePath (objectInterfaceDir bconfig)
@@ -83,10 +87,23 @@ ghci GhciOpts{..} = do
     $logInfo
         ("Configuring GHCi with the following packages: " <>
          T.intercalate ", " (map (packageNameText . ghciPkgName) pkgs))
-    exec
-        defaultEnvSettings
-        (fromMaybe (compilerExeName wc) ghciGhcCommand)
-        ("--interactive" : odir <> pkgopts <> srcfiles <> ghciArgs)
+    tmp <- liftIO getTemporaryDirectory
+    withCanonicalizedTempDirectory
+        tmp
+        "ghci-script"
+        (\tmpDir ->
+              do let scriptPath = tmpDir </> $(mkRelFile "ghci-script")
+                     fp = toFilePath scriptPath
+                     loadModules = ":l " <> unwords modulesToLoad
+                     bringIntoScope = ":m + " <> unwords modulesToLoad
+                 liftIO (writeFile fp (unlines [loadModules,bringIntoScope]))
+                 finally (exec
+                              defaultEnvSettings
+                              (fromMaybe (compilerExeName wc) ghciGhcCommand)
+                              ("--interactive" :
+                               odir <> pkgopts <> ghciArgs <>
+                               ["-ghci-script=" <> fp]))
+                         (removeFile scriptPath))
 
 -- | Figure out the main-is file to load based on the targets. Sometimes there
 -- is none, sometimes it's unambiguous, sometimes it's
@@ -179,7 +196,7 @@ ghciSetup mainIs stringTargets = do
     econfig <- asks getEnvConfig
     (realTargets,_,_,_,sourceMap) <- loadSourceMap AllowNoTargets bopts
     menv <- getMinimalEnvOverride
-    (installedMap, _, _) <- getInstalled
+    (installedMap, _, _, _) <- getInstalled
         menv
         GetInstalledOpts
             { getInstalledProfiling = False
@@ -198,13 +215,19 @@ ghciSetup mainIs stringTargets = do
                                  return (Just (name, (cabalfp, simpleTargets)))
                              Nothing -> return Nothing
                     else return Nothing
+    let localLibs = [name | (name, (_, target)) <- locals, targetIncludesLib target]
     infos <-
         forM locals $
-        \(name,(cabalfp,components)) ->
-             makeGhciPkgInfo sourceMap installedMap (map fst locals) name cabalfp components
+        \(name,(cabalfp,component)) ->
+             makeGhciPkgInfo sourceMap installedMap localLibs name cabalfp component
     unless (M.null realTargets) (build (const (return ())) Nothing bopts)
     return (realTargets, mainIsTargets, infos)
   where
+    -- NOTE: this doesn't mean that the cabal package actually has a
+    -- library, just that if it does, the requested target includes it.
+    targetIncludesLib STLocalAll = True
+    targetIncludesLib (STLocalComps comps) = S.member CLib comps
+    targetIncludesLib _ = False
     makeBuildOpts targets =
         base
         { boptsTargets = stringTargets
@@ -246,7 +269,7 @@ makeGhciPkgInfo
     -> Path Abs File
     -> SimpleTarget
     -> m GhciPkgInfo
-makeGhciPkgInfo sourceMap installedMap locals name cabalfp components = do
+makeGhciPkgInfo sourceMap installedMap locals name cabalfp component = do
     econfig <- asks getEnvConfig
     bconfig <- asks getBuildConfig
     let config =
@@ -265,17 +288,28 @@ makeGhciPkgInfo sourceMap installedMap locals name cabalfp components = do
             M.elems
                 (M.filterWithKey
                      (\k _ ->
-                           case components of
+                           case component of
                                STLocalComps cs -> S.member k cs
                                _ -> True)
                      m)
+        filteredOptions =
+            nub (map
+                     (\x ->
+                           if badForGhci x
+                               then Left x
+                               else Right x)
+                     (generalOpts <>
+                      concat (filterWithinWantedComponents componentsOpts)))
+    case lefts filteredOptions of
+        [] -> return ()
+        options ->
+            $logWarn
+                ("The following GHC options are incompatible with GHCi and have not been passed to it: " <>
+                 T.unwords (map T.pack options))
     return
         GhciPkgInfo
         { ghciPkgName = packageName pkg
-        , ghciPkgOpts = filter
-              (not . badForGhci)
-              (generalOpts <>
-               concat (filterWithinWantedComponents componentsOpts))
+        , ghciPkgOpts = rights filteredOptions
         , ghciPkgDir = parent cabalfp
         , ghciPkgModules = mconcat
               (filterWithinWantedComponents componentsModules)
@@ -290,5 +324,5 @@ makeGhciPkgInfo sourceMap installedMap locals name cabalfp components = do
   where
     badForGhci :: String -> Bool
     badForGhci x =
-        isPrefixOf "-O" x || elem x (words "-debug -threaded -ticky")
+        isPrefixOf "-O" x || elem x (words "-debug -threaded -ticky -static")
     setMapMaybe f = S.fromList . mapMaybe f . S.toList

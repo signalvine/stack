@@ -70,6 +70,7 @@ import           Distribution.Simple.Utils
 import           Distribution.System (OS (..), Arch, Platform (..))
 import           Distribution.Text (display, simpleParse)
 import           Path as FL
+import           Path.Extra
 import           Path.Find
 import           Path.IO
 import           Prelude
@@ -195,10 +196,10 @@ resolvePackage packageConfig gpkg =
       [T.pack (exeName b) | b <- executables pkg
                           , buildable (buildInfo b)]
     , packageOpts = GetPackageOpts $
-      \sourceMap installedMap locals cabalfp ->
+      \sourceMap installedMap omitPkgs cabalfp ->
            do (componentsModules,componentFiles,_,_) <- getPackageFiles pkgFiles cabalfp
               (componentsOpts,generalOpts) <-
-                  generatePkgDescOpts sourceMap installedMap locals cabalfp pkg componentFiles
+                  generatePkgDescOpts sourceMap installedMap omitPkgs cabalfp pkg componentFiles
               return (componentsModules,componentFiles,componentsOpts,generalOpts)
     , packageHasExposedModules = maybe
           False
@@ -212,11 +213,11 @@ resolvePackage packageConfig gpkg =
     pkgFiles = GetPackageFiles $
         \cabalfp ->
              do distDir <- distDirFromDir (parent cabalfp)
-                (componentModules,componentFiles,cabalFiles,warnings) <-
+                (componentModules,componentFiles,dataFiles',warnings) <-
                     runReaderT
                         (packageDescModulesAndFiles pkg)
                         (cabalfp, buildDir distDir)
-                return (componentModules, componentFiles, cabalFiles, warnings)
+                return (componentModules, componentFiles, S.insert cabalfp dataFiles', warnings)
     pkgId = package (packageDescription gpkg)
     name = fromCabalPackageName (pkgName pkgId)
     pkg = resolvePackageDescription packageConfig gpkg
@@ -229,12 +230,12 @@ generatePkgDescOpts
     :: (HasEnvConfig env, HasPlatform env, MonadThrow m, MonadReader env m, MonadIO m)
     => SourceMap
     -> InstalledMap
-    -> [PackageName]
+    -> [PackageName] -- ^ Packages to omit from the "-package" / "-package-id" flags
     -> Path Abs File
     -> PackageDescription
     -> Map NamedComponent (Set DotCabalPath)
     -> m (Map NamedComponent [String],[String])
-generatePkgDescOpts sourceMap installedMap locals cabalfp pkg componentPaths = do
+generatePkgDescOpts sourceMap installedMap omitPkgs cabalfp pkg componentPaths = do
     distDir <- distDirFromDir cabalDir
     let cabalmacros = autogenDir distDir </> $(mkRelFile "cabal_macros.h")
     exists <- fileExists cabalmacros
@@ -250,7 +251,7 @@ generatePkgDescOpts sourceMap installedMap locals cabalfp pkg componentPaths = d
                   mcabalmacros
                   cabalDir
                   distDir
-                  locals
+                  omitPkgs
                   binfo
                   (fromMaybe mempty (M.lookup namedComponent componentPaths))
                   namedComponent)
@@ -276,7 +277,7 @@ generatePkgDescOpts sourceMap installedMap locals cabalfp pkg componentPaths = d
                    , map
                          (\test ->
                                (generate
-                                    (CBench (T.pack (testName test)))
+                                    (CTest (T.pack (testName test)))
                                     (testBuildInfo test)))
                          (testSuites pkg)])
         , ["-hide-all-packages"])
@@ -295,7 +296,7 @@ generateBuildInfoOpts
     -> Set DotCabalPath
     -> NamedComponent
     -> [String]
-generateBuildInfoOpts sourceMap installedMap mcabalmacros cabalDir distDir locals b dotCabalPaths componentName =
+generateBuildInfoOpts sourceMap installedMap mcabalmacros cabalDir distDir omitPkgs b dotCabalPaths componentName =
     nubOrd (concat [ghcOpts b, extOpts b, srcOpts, includeOpts, macros, deps, extra b, extraDirs, fworks b, cObjectFiles])
   where
     cObjectFiles =
@@ -306,13 +307,13 @@ generateBuildInfoOpts sourceMap installedMap mcabalmacros cabalDir distDir local
     deps =
         concat
             [ case M.lookup (fromCabalPackageName name) installedMap of
-                Just (_, _, Stack.Types.Library _ident ipid) -> ["-package-id=" <> ghcPkgIdString ipid]
+                Just (_, Stack.Types.Library _ident ipid) -> ["-package-id=" <> ghcPkgIdString ipid]
                 _ -> ["-package=" <> display name <>
                  maybe "" -- This empty case applies to e.g. base.
                      ((("-" <>) . versionString) . sourceVersion)
                      (M.lookup (fromCabalPackageName name) sourceMap)]
             | Dependency name _ <- targetBuildDepends b
-            , not (elem name (map toCabalPackageName locals))]
+            , not (elem name (map toCabalPackageName omitPkgs))]
         -- Generates: -package=base -package=base16-bytestring-0.1.1.6 ...
     sourceVersion (PSUpstream ver _ _) = ver
     sourceVersion (PSLocal localPkg) = packageVersion (lpPackage localPkg)
@@ -327,9 +328,12 @@ generateBuildInfoOpts sourceMap installedMap mcabalmacros cabalDir distDir local
         isGhc _ = False
     extOpts = map (("-X" ++) . display) . usedExtensions
     srcOpts =
+        -- This initial "-i" resets the include directories to not
+        -- include CWD.
+        "-i" :
         map
             (("-i" <>) . toFilePath)
-            (cabalDir :
+            ((if null (hsSourceDirs b) then [cabalDir] else []) <>
              map (cabalDir </>) (mapMaybe parseRelDir (hsSourceDirs b)) <>
              [autogenDir distDir,buildDir distDir]) ++
         ["-stubdir=" ++ toFilePath (buildDir distDir)]
@@ -983,7 +987,7 @@ warnMultiple name candidate rest =
     $logWarn
         ("There were multiple candidates for the Cabal entry \"" <>
          showName name <>
-         "(" <>
+         "\" (" <>
          T.intercalate "," (map (T.pack . toFilePath) rest) <>
          "), picking " <>
          T.pack (toFilePath candidate))

@@ -4,6 +4,7 @@ module Stack.Options
     (Command(..)
     ,benchOptsParser
     ,buildOptsParser
+    ,configCmdSetParser
     ,configOptsParser
     ,dockerOptsParser
     ,dockerCleanupOptsParser
@@ -15,9 +16,9 @@ module Stack.Options
     ,newOptsParser
     ,logLevelOptsParser
     ,ghciOptsParser
-    ,abstractResolverOptsParser
     ,solverOptsParser
     ,testOptsParser
+    ,hpcReportOptsParser
     ,pvpBoundsOption
     ) where
 
@@ -36,9 +37,11 @@ import           Data.Text.Read (decimal)
 import           Options.Applicative.Args
 import           Options.Applicative.Builder.Extra
 import           Options.Applicative.Simple
-import           Options.Applicative.Types (readerAsk)
+import           Options.Applicative.Types (fromM, oneM, readerAsk)
 import           Stack.Config (packagesParser)
+import           Stack.ConfigCmd
 import           Stack.Constants (stackProgName)
+import           Stack.Coverage (HpcReportOpts(..))
 import           Stack.Docker
 import qualified Stack.Docker as Docker
 import           Stack.Dot
@@ -64,10 +67,8 @@ benchOptsParser = BenchmarkOpts
                                  metavar "BENCH_ARGS" <>
                                  help ("Forward BENCH_ARGS to the benchmark suite. " <>
                                        "Supports templates from `cabal bench`")))
-        <*> flag False
-                 True
-                 (long "no-run-benchmarks" <>
-                  help "Disable running of benchmarks. (Benchmarks will still be built.)")
+        <*> switch (long "no-run-benchmarks" <>
+                   help "Disable running of benchmarks. (Benchmarks will still be built.)")
 
 addCoverageFlags :: BuildOpts -> BuildOpts
 addCoverageFlags bopts
@@ -115,12 +116,16 @@ buildOptsParser cmd =
             "copying binaries to the local-bin-path (see 'stack path')"
             idm
 
-        dryRun = flag False True (long "dry-run" <>
-                                  help "Don't build anything, just prepare to")
-        ghcOpts = (++)
+        dryRun = switch (long "dry-run" <>
+                         help "Don't build anything, just prepare to")
+        ghcOpts = (\x y z -> concat [x, y, z])
           <$> flag [] ["-Wall", "-Werror"]
               ( long "pedantic"
-             <> help "Turn on -Wall and -Werror (note: option name may change in the future"
+             <> help "Turn on -Wall and -Werror"
+              )
+          <*> flag [] ["-O0"]
+              ( long "fast"
+             <> help "Turn off optimizations (-O0)"
               )
           <*> many (textOption (long "ghc-options" <>
                                 metavar "OPTION" <>
@@ -133,7 +138,7 @@ buildOptsParser cmd =
                        help ("Override flags set in stack.yaml " <>
                              "(applies to local packages and extra-deps)")))
 
-        preFetch = flag False True
+        preFetch = switch
             (long "prefetch" <>
              help "Fetch packages necessary for the build immediately, useful with --dry-run")
 
@@ -163,7 +168,7 @@ buildOptsParser cmd =
             "continue running after a step fails (default: false for build, true for test/bench)"
             idm
 
-        forceDirty = flag False True
+        forceDirty = switch
             (long "force-dirty" <>
              help "Force treating all local packages as having dirty files (useful for cases where stack can't detect a file change)")
 
@@ -182,15 +187,15 @@ buildOptsParser cmd =
               metavar "CMD [ARGS]" <>
               help "Command and arguments to run after a successful build" )
 
-        onlyConfigure = flag False True
+        onlyConfigure = switch
             (long "only-configure" <>
              help "Only perform the configure step, not any builds. Intended for tool usage, may break when used on multiple packages at once!")
 
-        reconfigure = flag False True
+        reconfigure = switch
             (long "reconfigure" <>
              help "Perform the configure step even if unnecessary. Useful in some corner cases with custom Setup.hs files")
 
-        cabalVerbose = flag False True
+        cabalVerbose = switch
             (long "cabal-verbose" <>
              help "Ask Cabal to be verbose in its output")
 
@@ -293,7 +298,7 @@ configOptsParser docker =
 dockerOptsParser :: Bool -> Parser DockerOptsMonoid
 dockerOptsParser showOptions =
     DockerOptsMonoid
-    <$> pure Nothing
+    <$> pure False
     <*> maybeBoolFlags dockerCmdName
                        "using a Docker container"
                        hide
@@ -459,8 +464,8 @@ ghciOptsParser = GhciOpts
                      (strOption (long "with-ghc" <>
                                  metavar "GHC" <>
                                  help "Use this command for the GHC to run"))
-             <*> flag False True (long "no-load" <>
-                   help "Don't load modules on start-up")
+             <*> switch (long "no-load" <>
+                         help "Don't load modules on start-up")
              <*> packagesParser
              <*> optional
                      (textOption
@@ -471,8 +476,7 @@ ghciOptsParser = GhciOpts
                                  \test suite or benchmark."))
 
 -- | Parser for exec command
-execOptsParser :: Maybe String -- ^ command
-               -> Parser ExecOpts
+execOptsParser :: Maybe SpecialExecCmd -> Parser ExecOpts
 execOptsParser mcmd =
     ExecOpts
         <$> pure mcmd
@@ -485,16 +489,15 @@ execOptsParser mcmd =
         meta = (maybe ("CMD ") (const "") mcmd) ++
                "-- ARGS (e.g. stack ghc -- X.hs -o x)"
 
-evalOptsParser :: Maybe String -- ^ metavar
+evalOptsParser :: String -- ^ metavar
                -> Parser EvalOpts
-evalOptsParser mmeta =
+evalOptsParser meta =
     EvalOpts
         <$> eoArgsParser
         <*> execOptsExtraParser
   where
     eoArgsParser :: Parser String
     eoArgsParser = strArgument (metavar meta)
-    meta = maybe ("CODE") id mmeta
 
 -- | Parser for extra options to exec command
 execOptsExtraParser :: Parser ExecOptsExtra
@@ -535,6 +538,7 @@ globalOptsParser defaultTerminal =
     logLevelOptsParser <*>
     configOptsParser False <*>
     optional abstractResolverOptsParser <*>
+    optional compilerOptsParser <*>
     flag
         defaultTerminal
         False
@@ -550,14 +554,10 @@ initOptsParser :: Parser InitOpts
 initOptsParser =
     InitOpts <$> method <*> overwrite <*> fmap not ignoreSubDirs
   where
-    ignoreSubDirs = flag False
-                         True
-                         (long "ignore-subdirs" <>
-                         help "Do not search for .cabal files in sub directories")
-    overwrite = flag False
-                     True
-                     (long "force" <>
-                      help "Force overwriting of an existing stack.yaml if it exists")
+    ignoreSubDirs = switch (long "ignore-subdirs" <>
+                           help "Do not search for .cabal files in sub directories")
+    overwrite = switch (long "force" <>
+                       help "Force overwriting of an existing stack.yaml if it exists")
     method = solver
          <|> (MethodResolver <$> resolver)
          <|> (MethodSnapshot <$> snapPref)
@@ -630,6 +630,20 @@ readAbstractResolver = do
                 Left e -> readerError $ show e
                 Right x -> return $ ARResolver x
 
+compilerOptsParser :: Parser CompilerVersion
+compilerOptsParser =
+    option readCompilerVersion
+        (long "compiler" <>
+         metavar "COMPILER" <>
+         help "Use the specified compiler")
+
+readCompilerVersion :: ReadM CompilerVersion
+readCompilerVersion = do
+    s <- readerAsk
+    case parseCompilerVersion (T.pack s) of
+        Nothing -> readerError $ "Failed to parse compiler: " ++ s
+        Just x -> return x
+
 -- | GHC variant parser
 ghcVariantParser :: Parser GHCVariant
 ghcVariantParser =
@@ -663,14 +677,10 @@ testOptsParser = TestOpts
                 (optional (argsOption(long "test-arguments" <>
                                       metavar "TEST_ARGS" <>
                                       help "Arguments passed in to the test suite program")))
-      <*> flag False
-               True
-               (long "coverage" <>
-               help "Generate a code coverage report")
-      <*> flag False
-               True
-               (long "no-run-tests" <>
-                help "Disable running of tests. (Tests will still be built.)")
+      <*> switch (long "coverage" <>
+                 help "Generate a code coverage report")
+      <*> switch (long "no-run-tests" <>
+                 help "Disable running of tests. (Tests will still be built.)")
 
 -- | Parser for @stack new@.
 newOptsParser :: Parser (NewOpts,InitOpts)
@@ -685,7 +695,8 @@ newOptsParser = (,) <$> newOpts <*> initOptsParser
              help "Do not create a subdirectory for the project") <*>
         templateNameArgument
             (metavar "TEMPLATE_NAME" <>
-             help "Name of a template, for example: foo or foo.hsfiles" <>
+             help "Name of a template or a local template in a subdirectory,\
+                  \ for example: foo or foo.hsfiles" <>
              value defaultTemplateName) <*>
         fmap
             M.fromList
@@ -695,6 +706,13 @@ newOptsParser = (,) <$> newOpts <*> initOptsParser
                        help
                            "Parameter for the template in the format key:value"))) <*
         abortOption ShowHelpText (long "help" <> help "Show help text.")
+
+-- | Parser for @stack hpc report@.
+hpcReportOptsParser :: Parser HpcReportOpts
+hpcReportOptsParser = HpcReportOpts
+    <$> (many $ textArgument $ metavar "TARGET_OR_TIX")
+    <*> switch (long "all" <> help "Use results from all packages and components")
+    <*> optional (strOption (long "destdir" <> help "Output directy for HTML report"))
 
 pvpBoundsOption :: Parser PvpBounds
 pvpBoundsOption =
@@ -707,5 +725,27 @@ pvpBoundsOption =
     readPvpBounds = do
         s <- readerAsk
         case parsePvpBounds $ T.pack s of
-            Left e -> readerError e
-            Right v -> return v
+            Left e ->
+                readerError e
+            Right v ->
+                return v
+
+configCmdSetParser :: Parser ConfigCmdSet
+configCmdSetParser =
+    fromM
+        (do field <-
+                oneM
+                    (strArgument
+                         (metavar "FIELD VALUE"))
+            oneM (fieldToValParser field))
+  where
+    fieldToValParser :: String -> Parser ConfigCmdSet
+    fieldToValParser s = do
+        case s of
+            "resolver" ->
+                ConfigCmdSetResolver <$>
+                argument
+                    readAbstractResolver
+                    idm
+            _ ->
+                error "parse stack config set field: only set resolver is implemented"

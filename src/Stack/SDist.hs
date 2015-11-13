@@ -14,7 +14,7 @@ import qualified Codec.Archive.Tar.Entry as Tar
 import qualified Codec.Compression.GZip as GZip
 import           Control.Applicative
 import           Control.Concurrent.Execute (ActionContext(..))
-import           Control.Monad (when, void)
+import           Control.Monad (unless, void)
 import           Control.Monad.Catch (MonadMask)
 import           Control.Monad.IO.Class
 import           Control.Monad.Logger
@@ -171,7 +171,7 @@ readLocalPackage pkgDir = do
     mapM_ (printCabalFileWarning cabalfp) warnings
     return LocalPackage
         { lpPackage = package
-        , lpExeComponents = Nothing -- HACK: makes it so that sdist output goes to a log instead of a file.
+        , lpWanted = False -- HACK: makes it so that sdist output goes to a log instead of a file.
         , lpDir = pkgDir
         , lpCabalFile = cabalfp
         -- NOTE: these aren't the 'correct values, but aren't used in
@@ -196,7 +196,7 @@ getSDistFileList lp =
         runInBase <- liftBaseWith $ \run -> return (void . run)
         withExecuteEnv menv bopts baseConfigOpts locals
             [] [] [] -- provide empty list of globals. This is a hack around custom Setup.hs files
-            sourceMap $ \ee -> do
+            sourceMap $ \ee ->
             withSingleContext runInBase ac ee task Nothing (Just "sdist") $ \_package cabalfp _pkgDir cabal _announce _console _mlogFile -> do
                 let outFile = toFilePath tmpdir FP.</> "source-files-list"
                 cabal False ["sdist", "--list-sources", outFile]
@@ -213,13 +213,14 @@ getSDistFileList lp =
             , tcoOpts = \_ -> ConfigureOpts [] []
             }
         , taskPresent = Map.empty
+        , taskAllInOne = True
         }
 
 normalizeTarballPaths :: M env m => [FilePath] -> m [FilePath]
 normalizeTarballPaths fps = do
     --TODO: consider whether erroring out is better - otherwise the
     --user might upload an incomplete tar?
-    when (not (null outsideDir)) $
+    unless (null outsideDir) $
         $logWarn $ T.concat
             [ "Warning: These files are outside of the package directory, and will be omitted from the tarball: "
             , T.pack (show outsideDir)]
@@ -228,7 +229,7 @@ normalizeTarballPaths fps = do
     (outsideDir, files) = partitionEithers (map pathToEither fps)
     pathToEither fp = maybe (Left fp) Right (normalizePath fp)
 
-normalizePath :: FilePath -> (Maybe FilePath)
+normalizePath :: FilePath -> Maybe FilePath
 normalizePath = fmap FP.joinPath . go . FP.splitDirectories . FP.normalise
   where
     go [] = Just []

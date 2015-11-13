@@ -120,6 +120,7 @@ data StackBuildException
   | DuplicateLocalPackageNames [(PackageName, [Path Abs Dir])]
   | SolverMissingCabalInstall
   | SolverMissingGHC
+  | SolverNoCabalFiles
   deriving Typeable
 
 data FlagSource = FSCommandLine | FSStackYaml
@@ -326,6 +327,10 @@ instance Show StackBuildException where
         [ "Solver requires that GHC be on your PATH"
         , "Try running 'stack setup'"
         ]
+    show SolverNoCabalFiles = unlines
+        [ "No cabal files provided.  Maybe this is due to not having a stack.yaml file?"
+        , "Try running 'stack init' to create a stack.yaml"
+        ]
 
 instance Exception StackBuildException
 
@@ -405,7 +410,7 @@ data BuildSubset
     -- ^ Only install packages in the snapshot database, skipping
     -- packages intended for the local database.
     | BSOnlyDependencies
-    deriving Show
+    deriving (Show, Eq)
 
 -- | Configuration for building.
 data BuildOpts =
@@ -554,10 +559,15 @@ instance HasSemanticVersion ConfigCache
 
 -- | A task to perform when building
 data Task = Task
-    { taskProvides        :: !PackageIdentifier        -- ^ the package/version to be built
-    , taskType            :: !TaskType                 -- ^ the task type, telling us how to build this
+    { taskProvides        :: !PackageIdentifier
+    -- ^ the package/version to be built
+    , taskType            :: !TaskType
+    -- ^ the task type, telling us how to build this
     , taskConfigOpts      :: !TaskConfigOpts
-    , taskPresent         :: !(Map PackageIdentifier GhcPkgId)           -- ^ GhcPkgIds of already-installed dependencies
+    , taskPresent         :: !(Map PackageIdentifier GhcPkgId)
+    -- ^ GhcPkgIds of already-installed dependencies
+    , taskAllInOne        :: !Bool
+    -- ^ indicates that the package can be built in one step
     }
     deriving Show
 
@@ -591,7 +601,7 @@ taskLocation task =
 -- | A complete plan of what needs to be built and how to do it
 data Plan = Plan
     { planTasks :: !(Map PackageName Task)
-    , planFinals :: !(Map PackageName (Task, LocalPackageTB))
+    , planFinals :: !(Map PackageName Task)
     -- ^ Final actions to be taken (test, benchmark, etc)
     , planUnregisterLocal :: !(Map GhcPkgId (PackageIdentifier, Maybe Text))
     -- ^ Text is reason we're unregistering, for display only
@@ -711,8 +721,8 @@ configureOptsNoDir econfig bco deps wanted isLocal package = concat
 
     ghcOptionsMap = configGhcOptions $ getConfig econfig
     allGhcOptions = concat
-        [ fromMaybe [] $ Map.lookup Nothing ghcOptionsMap
-        , fromMaybe [] $ Map.lookup (Just $ packageName package) ghcOptionsMap
+        [ Map.findWithDefault [] Nothing ghcOptionsMap
+        , Map.findWithDefault [] (Just $ packageName package) ghcOptionsMap
         , if includeExtraOptions
             then boptsGhcOptions bopts
             else []

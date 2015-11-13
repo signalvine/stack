@@ -60,7 +60,6 @@ import           Stack.BuildPlan (loadMiniBuildPlan, shadowMiniBuildPlan,
                                   parseCustomMiniBuildPlan)
 import           Stack.Constants (wiredInPackages)
 import           Stack.Package
-import           Stack.PackageIndex
 import           Stack.Types
 
 import           System.Directory
@@ -80,9 +79,10 @@ loadSourceMap needTargets bopts = do
     bconfig <- asks getBuildConfig
     rawLocals <- getLocalPackageViews
     (mbp0, cliExtraDeps, targets) <- parseTargetsFromBuildOpts needTargets bopts
-    menv <- getMinimalEnvOverride
-    caches <- getPackageCaches menv
-    let latestVersion = Map.fromListWith max $ map toTuple $ Map.keys caches
+    let latestVersion =
+            Map.fromListWith max $
+            map toTuple $
+            Map.keys (bcPackageCaches bconfig)
 
     -- Extend extra-deps to encompass targets requested on the command line
     -- that are not in the snapshot.
@@ -115,7 +115,7 @@ loadSourceMap needTargets bopts = do
         -- the snapshot
         extraDeps2 = Map.union
             (Map.map (\v -> (v, Map.empty)) extraDeps0)
-            (Map.map (\mpi -> (mpiVersion mpi, mpiFlags mpi)) extraDeps1)
+            (Map.map (mpiVersion &&& mpiFlags) extraDeps1)
 
         -- Overwrite any flag settings with those from the config file
         extraDeps3 = Map.mapWithKey
@@ -230,7 +230,7 @@ getLocalPackageViews = do
         (warnings,gpkg) <- readPackageUnresolved cabalfp
         mapM_ (printCabalFileWarning cabalfp) warnings
         let cabalID = package $ packageDescription gpkg
-            name = fromCabalPackageName $ pkgName $ cabalID
+            name = fromCabalPackageName $ pkgName cabalID
         checkCabalFileName name cabalfp
         let lpv = LocalPackageView
                 { lpvVersion = fromCabalVersion $ pkgVersion cabalID
@@ -329,11 +329,7 @@ loadLocalPackage bopts targets (name, (lpv, gpkg)) = do
 
         btpkg
             | Set.null tests && Set.null benches = Nothing
-            | otherwise = Just $ LocalPackageTB
-                { lptbPackage = resolvePackage btconfig gpkg
-                , lptbTests = tests
-                , lptbBenches = benches
-                }
+            | otherwise = Just (resolvePackage btconfig gpkg)
         testpkg = resolvePackage testconfig gpkg
         benchpkg = resolvePackage benchconfig gpkg
     mbuildCache <- tryGetBuildCache $ lpvRoot lpv
@@ -348,25 +344,20 @@ loadLocalPackage bopts targets (name, (lpv, gpkg)) = do
 
     return LocalPackage
         { lpPackage = pkg
-        , lpTestDeps = packageDeps $ testpkg
-        , lpBenchDeps = packageDeps $ benchpkg
-        , lpExeComponents =
-            case mtarget of
-                Nothing -> Nothing
-                Just _ -> Just exes
+        , lpTestDeps = packageDeps testpkg
+        , lpBenchDeps = packageDeps benchpkg
         , lpTestBench = btpkg
         , lpFiles = files
         , lpDirtyFiles =
             if not (Set.null dirtyFiles) || boptsForceDirty bopts
                 then let tryStripPrefix y =
-                            case stripPrefix (toFilePath $ lpvRoot lpv) y of
-                                Nothing -> y
-                                Just z -> z
+                          fromMaybe y (stripPrefix (toFilePath $ lpvRoot lpv) y)
                       in Just $ Set.map tryStripPrefix dirtyFiles
                 else Nothing
         , lpNewBuildCache = newBuildCache
         , lpCabalFile = lpvCabalFP lpv
         , lpDir = lpvRoot lpv
+        , lpWanted = isJust mtarget
         , lpComponents = Set.unions
             [ Set.map CExe exes
             , Set.map CTest tests
@@ -425,9 +416,9 @@ localFlags :: (Map (Maybe PackageName) (Map FlagName Bool))
            -> PackageName
            -> Map FlagName Bool
 localFlags boptsflags bconfig name = Map.unions
-    [ fromMaybe Map.empty $ Map.lookup (Just name) $ boptsflags
-    , fromMaybe Map.empty $ Map.lookup Nothing $ boptsflags
-    , fromMaybe Map.empty $ Map.lookup name $ bcFlags bconfig
+    [ Map.findWithDefault Map.empty (Just name) boptsflags
+    , Map.findWithDefault Map.empty Nothing boptsflags
+    , Map.findWithDefault Map.empty name (bcFlags bconfig)
     ]
 
 -- | Add in necessary packages to extra dependencies
@@ -468,7 +459,7 @@ checkBuildCache :: MonadIO m
                 -> [FilePath] -- ^ files in package
                 -> m (Set FilePath, Map FilePath FileCacheInfo)
 checkBuildCache oldCache files = liftIO $ do
-    (dirtyFiles, m) <- fmap mconcat $ mapM go files
+    (dirtyFiles, m) <- mconcat <$> mapM go files
     return (dirtyFiles, m)
   where
     go fp = do

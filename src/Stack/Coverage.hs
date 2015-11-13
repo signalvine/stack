@@ -17,7 +17,7 @@ module Stack.Coverage
 
 import           Control.Applicative
 import           Control.Exception.Lifted
-import           Control.Monad                  (liftM, when, void)
+import           Control.Monad                  (liftM, when, unless, void)
 import           Control.Monad.Catch            (MonadCatch)
 import           Control.Monad.IO.Class
 import           Control.Monad.Logger
@@ -29,6 +29,7 @@ import           Data.Function
 import           Data.List
 import qualified Data.Map.Strict                as Map
 import           Data.Maybe
+import           Data.Maybe.Extra               (mapMaybeM)
 import           Data.Monoid                    ((<>))
 import           Data.Text                      (Text)
 import qualified Data.Text                      as T
@@ -268,7 +269,7 @@ generateHpcUnifiedReport = do
             return (filter ((".tix" `isSuffixOf`) . toFilePath) files)
     let reportDir = outputDir </> $(mkRelDir "combined/all")
     if length tixFiles < 2
-        then $logInfo $ T.concat $
+        then $logInfo $ T.concat
             [ if null tixFiles then "No tix files" else "Only one tix file"
             , " found in "
             , T.pack (toFilePath outputDir)
@@ -279,10 +280,9 @@ generateHpcUnifiedReport = do
 generateUnionReport :: (MonadIO m,MonadReader env m,HasConfig env,MonadLogger m,MonadBaseControl IO m,MonadCatch m,HasEnvConfig env)
                     => Text -> Path Abs Dir -> [Path Abs File] -> m ()
 generateUnionReport report reportDir tixFiles = do
-    tixes <- mapM (liftM (fmap removeExeModules) . readTixOrLog) tixFiles
+    (errs, tix) <- fmap (unionTixes . map removeExeModules) (mapMaybeM readTixOrLog tixFiles)
     $logDebug $ "Using the following tix files: " <> T.pack (show tixFiles)
-    let (errs, tix) = unionTixes (catMaybes tixes)
-    when (not (null errs)) $ $logWarn $ T.concat $
+    unless (null errs) $ $logWarn $ T.concat $
         "The following modules are left out of the " : report : " due to version mismatches: " :
         intersperse ", " (map T.pack errs)
     tixDest <- liftM (reportDir </>) $ parseRelFile (dirnameString reportDir ++ ".tix")
@@ -364,14 +364,14 @@ generateHpcMarkupIndex = do
                 rows ++
                 ["</tbody></table>"]) ++
         ["</body></html>"]
-    when (not (null rows)) $
+    unless (null rows) $
         $logInfo $ "\nAn index of the generated HTML coverage reports is available at " <>
             T.pack (toFilePath outputFile)
 
 generateHpcErrorReport :: MonadIO m => Path Abs Dir -> Text -> m ()
 generateHpcErrorReport dir err = do
     createTree dir
-    liftIO $ T.writeFile (toFilePath (dir </> $(mkRelFile "hpc_index.html"))) $ T.concat $
+    liftIO $ T.writeFile (toFilePath (dir </> $(mkRelFile "hpc_index.html"))) $ T.concat
         [ "<html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\"></head><body>"
         , "<h1>HPC Report Generation Error</h1>"
         , "<p>"

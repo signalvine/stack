@@ -42,7 +42,7 @@ import           Data.Either
 import           Data.Foldable hiding (concatMap, or, maximum)
 import           Data.IORef
 import           Data.IORef.RunOnce (runOnce)
-import           Data.List hiding (concat, elem, maximumBy)
+import           Data.List hiding (concat, elem, maximumBy, any)
 import           Data.Map (Map)
 import qualified Data.Map as Map
 import           Data.Maybe
@@ -67,7 +67,7 @@ import           Path
 import           Path.Extra (toFilePathNoTrailingSep)
 import           Path.IO
 import qualified Paths_stack as Meta
-import           Prelude hiding (concat, elem) -- Fix AMP warning
+import           Prelude hiding (concat, elem, any) -- Fix AMP warning
 import           Safe (readMay)
 import           Stack.Build (build)
 import           Stack.Config (resolvePackageEntry, loadConfig)
@@ -282,9 +282,8 @@ setupEnv mResolveMissingGHC = do
                                         [ toFilePathNoTrailingSep deps
                                         , ""
                                         ])
-                        $ Map.insert "HASKELL_DIST_DIR" (T.pack $ toFilePathNoTrailingSep distDir)
-                        $ env
-                    !() <- atomicModifyIORef envRef $ \m' ->
+                        $ Map.insert "HASKELL_DIST_DIR" (T.pack $ toFilePathNoTrailingSep distDir) env
+                    () <- atomicModifyIORef envRef $ \m' ->
                         (Map.insert es eo m', ())
                     return eo
 
@@ -340,7 +339,8 @@ ensureCompiler sopts = do
                 arch /= expectedArch
         isWanted = isWantedCompiler (soptsCompilerCheck sopts) (soptsWantedCompiler sopts)
 
-    -- If we need to install a GHC, try to do so
+        -- If we need to install a GHC or MSYS, try to do so
+        -- Return the additional directory paths of GHC & MSYS.
     mtools <- if needLocal
         then do
             getSetupInfo' <- runOnce (getSetupInfo (soptsStackSetupYaml sopts) =<< asks getHttpManager)
@@ -366,7 +366,7 @@ ensureCompiler sopts = do
                             (soptsWantedCompiler sopts)
                             (soptsCompilerCheck sopts)
                             (soptsGHCBindistURL sopts)
-                    | otherwise -> do
+                    | otherwise ->
                         throwM $ CompilerVersionMismatch
                             msystem
                             (soptsWantedCompiler sopts, expectedArch)
@@ -405,6 +405,7 @@ ensureCompiler sopts = do
     mpaths <- case mtools of
         Nothing -> return Nothing
         Just (compilerTool, mmsys2Tool) -> do
+            -- Add GHC's and MSYS's paths to the config.
             let idents = catMaybes [Just compilerTool, mmsys2Tool]
             paths <- mapM extraDirs idents
             return $ Just $ mconcat paths
@@ -506,7 +507,7 @@ upgradeCabal menv wc = do
 
             dir <-
                 case Map.lookup ident m of
-                    Nothing -> error $ "upgradeCabal: Invariant violated, dir missing"
+                    Nothing -> error "upgradeCabal: Invariant violated, dir missing"
                     Just dir -> return dir
 
             runIn dir (compilerExeName wc) menv ["Setup.hs"] Nothing
@@ -635,7 +636,7 @@ downloadAndInstallCompiler :: (MonadIO m, MonadMask m, MonadLogger m, MonadReade
                            => SetupInfo
                            -> CompilerVersion
                            -> VersionCheck
-                           -> (Maybe String)
+                           -> Maybe String
                            -> m Tool
 downloadAndInstallCompiler si wanted@(GhcVersion{}) versionCheck mbindistURL = do
     ghcVariant <- asks getGHCVariant
@@ -669,7 +670,7 @@ downloadAndInstallCompiler si wanted@(GhcVersion{}) versionCheck mbindistURL = d
     ghcPkgName <- parsePackageNameFromString ("ghc" ++ ghcVariantSuffix ghcVariant)
     let tool = Tool $ PackageIdentifier ghcPkgName selectedVersion
     downloadAndInstallTool (configLocalPrograms config) si downloadInfo tool installer
-downloadAndInstallCompiler si wanted@(GhcjsVersion version _) versionCheck _mbindistUrl = do
+downloadAndInstallCompiler si wanted versionCheck _mbindistUrl = do
     config <- asks getConfig
     ghcVariant <- asks getGHCVariant
     case ghcVariant of
@@ -680,7 +681,11 @@ downloadAndInstallCompiler si wanted@(GhcjsVersion version _) versionCheck _mbin
         Just pairs -> getWantedCompilerInfo "source" versionCheck wanted id pairs
     $logInfo "Preparing to install GHCJS to an isolated location."
     $logInfo "This will not interfere with any system-level installation."
-    downloadAndInstallTool (configLocalPrograms config) si downloadInfo (ToolGhcjs selectedVersion) (installGHCJS version)
+    let tool = ToolGhcjs selectedVersion
+        installer = installGHCJS $ case selectedVersion of
+            GhcjsVersion version _ -> version
+            _ -> error "Invariant violated: expected ghcjs version in downloadAndInstallCompiler."
+    downloadAndInstallTool (configLocalPrograms config) si downloadInfo tool installer
 
 getWantedCompilerInfo :: (Ord k, MonadThrow m)
                       => Text
@@ -689,7 +694,7 @@ getWantedCompilerInfo :: (Ord k, MonadThrow m)
                       -> (k -> CompilerVersion)
                       -> Map k a
                       -> m (k, a)
-getWantedCompilerInfo key versionCheck wanted toCV pairs = do
+getWantedCompilerInfo key versionCheck wanted toCV pairs =
     case mpair of
         Just pair -> return pair
         Nothing -> throwM $ UnknownCompilerVersion key wanted (map toCV (Map.keys pairs))
@@ -709,7 +714,7 @@ getGhcKey = do
 
 getOSKey :: (MonadReader env m, MonadThrow m, HasPlatform env, MonadLogger m, MonadIO m, MonadCatch m, MonadBaseControl IO m)
          => Platform -> m Text
-getOSKey platform = do
+getOSKey platform =
     case platform of
         Platform I386   Cabal.Linux   -> return "linux32"
         Platform X86_64 Cabal.Linux   -> return "linux64"
@@ -788,7 +793,7 @@ installGHCPosix version _ archiveFile archiveType destDir = do
             parseRelDir $
             "ghc-" ++ versionString version
 
-        $logSticky $ T.concat ["Unpacking GHC into ", (T.pack . toFilePath $ root), " ..."]
+        $logSticky $ T.concat ["Unpacking GHC into ", T.pack . toFilePath $ root, " ..."]
         $logDebug $ "Unpacking " <> T.pack (toFilePath archiveFile)
         readInNull root tarTool menv ["xf", toFilePath archiveFile] Nothing
 
@@ -832,7 +837,7 @@ installGHCJS version si archiveFile archiveType destDir = do
     let unpackDir = destDir Path.</> $(mkRelDir "src")
     tarComponent <- parseRelDir ("ghcjs-" ++ versionString version)
     runUnpack <- case platform of
-        Platform _ Cabal.Windows -> return $ do
+        Platform _ Cabal.Windows -> return $
             withUnpackedTarball7z "GHCJS" si archiveFile archiveType tarComponent unpackDir
         _ -> do
             zipTool' <-
@@ -851,7 +856,7 @@ installGHCJS version si archiveFile archiveType destDir = do
                 readInNull destDir tarTool menv ["xf", toFilePath archiveFile] Nothing
                 renameDir (destDir Path.</> tarComponent) unpackDir
 
-    $logSticky $ T.concat ["Unpacking GHCJS into ", (T.pack . toFilePath $ unpackDir), " ..."]
+    $logSticky $ T.concat ["Unpacking GHCJS into ", T.pack . toFilePath $ unpackDir, " ..."]
     $logDebug $ "Unpacking " <> T.pack (toFilePath archiveFile)
     runUnpack
 
@@ -931,7 +936,7 @@ ensureGhcjsBooted menv cv shouldBoot  = do
                             parseRelFile $ "ghcjs-" ++ versionString version ++ "/stack.yaml"
                         _ -> fail "ensureGhcjsBooted invoked on non GhcjsVersion"
                 actualStackYamlExists <- fileExists actualStackYaml
-                when (not actualStackYamlExists) $
+                unless actualStackYamlExists $
                     fail "Couldn't find GHCJS stack.yaml in old or new location."
                 bootGhcjs actualStackYaml destDir
         Left err -> throwM err
@@ -1101,7 +1106,7 @@ withUnpackedTarball7z name si archiveFile archiveType srcDir destDir = do
             Nothing -> error $ "Invalid " ++ name ++ " filename: " ++ show archiveFile
             Just x -> parseAbsFile $ T.unpack x
     run7z <- setup7z si
-    let tmpName = (toFilePathNoTrailingSep $ dirname destDir) ++ "-tmp"
+    let tmpName = toFilePathNoTrailingSep (dirname destDir) ++ "-tmp"
     createTree (parent destDir)
     withCanonicalizedTempDirectory (toFilePath $ parent destDir) tmpName $ \tmpDir -> do
         let absSrcDir = tmpDir </> srcDir
@@ -1120,7 +1125,7 @@ withUnpackedTarball7z name si archiveFile archiveType srcDir destDir = do
 -- | Download 7z as necessary, and get a function for unpacking things.
 --
 -- Returned function takes an unpack directory and archive.
-setup7z :: (MonadReader env m, HasHttpManager env, HasConfig env, MonadThrow m, MonadIO m, MonadIO n, MonadLogger m, MonadBaseControl IO m)
+setup7z :: (MonadReader env m, HasHttpManager env, HasConfig env, MonadThrow m, MonadIO m, MonadIO n, MonadLogger m, MonadLogger n, MonadBaseControl IO m)
         => SetupInfo
         -> m (Path Abs Dir -> Path Abs File -> n ())
 setup7z si = do
@@ -1131,15 +1136,18 @@ setup7z si = do
         (Just sevenzDll, Just sevenzExe) -> do
             chattyDownload "7z.dll" sevenzDll dll
             chattyDownload "7z.exe" sevenzExe exe
-            return $ \outdir archive -> liftIO $ do
-                ec <- rawSystem (toFilePath exe)
-                    [ "x"
-                    , "-o" ++ toFilePath outdir
-                    , "-y"
-                    , toFilePath archive
-                    ]
+            return $ \outdir archive -> do
+                let cmd = toFilePath exe
+                    args =
+                        [ "x"
+                        , "-o" ++ toFilePath outdir
+                        , "-y"
+                        , toFilePath archive
+                        ]
+                $logProcessRun cmd args
+                ec <- liftIO $ rawSystem cmd args
                 when (ec /= ExitSuccess)
-                    $ throwM (ProblemWhileDecompressing archive)
+                    $ liftIO $ throwM (ProblemWhileDecompressing archive)
         _ -> throwM SetupInfoMissingSevenz
 
 chattyDownload :: (MonadReader env m, HasHttpManager env, MonadIO m, MonadLogger m, MonadThrow m, MonadBaseControl IO m)
@@ -1219,7 +1227,7 @@ chattyDownload label downloadInfo path = do
                  (T.unpack label)
                  percentage
           where percentage :: Double
-                percentage = (fromIntegral totalSoFar / fromIntegral total * 100)
+                percentage = fromIntegral totalSoFar / fromIntegral total * 100
 
 -- | Given a printf format string for the decimal part and a number of
 -- bytes, formats the bytes using an appropiate unit and returns the
@@ -1318,10 +1326,7 @@ getUtf8LocaleVars menv = do
                 existingVarNames = Set.unions (map snd checkedVars)
                 -- True if a locale is already specified by one of the "global" locale variables.
                 hasAnyExisting =
-                    or $
-                    map
-                        (`Set.member` existingVarNames)
-                        ["LANG", "LANGUAGE", "LC_ALL"]
+                    any (`Set.member` existingVarNames) ["LANG", "LANGUAGE", "LC_ALL"]
             if null needChangeVars && hasAnyExisting
                 then
                      -- If no variables need changes and at least one "global" variable is set, no
@@ -1403,7 +1408,7 @@ getUtf8LocaleVars menv = do
     -- -a@.
     getFallbackLocale
         :: [Text] -> Maybe Text
-    getFallbackLocale utf8Locales = do
+    getFallbackLocale utf8Locales =
         case concatMap (matchingLocales utf8Locales) fallbackPrefixes of
             (v:_) -> Just v
             [] ->
@@ -1414,17 +1419,10 @@ getUtf8LocaleVars menv = do
     matchingLocales
         :: [Text] -> Text -> [Text]
     matchingLocales utf8Locales prefix =
-        filter
-            (\v ->
-                  (T.toLower prefix) `T.isPrefixOf` T.toLower v)
-            utf8Locales
+        filter (\v -> T.toLower prefix `T.isPrefixOf` T.toLower v) utf8Locales
     -- Does the locale have one of the encodings in @utf8Suffixes@ (case-insensitive)?
     isUtf8Locale locale =
-        or $
-        map
-            (\v ->
-                  T.toLower v `T.isSuffixOf` T.toLower locale)
-            utf8Suffixes
+      any (\ v -> T.toLower v `T.isSuffixOf` T.toLower locale) utf8Suffixes
     -- Prefixes of fallback locales (case-insensitive)
     fallbackPrefixes = ["C.", "en_US.", "en_"]
     -- Suffixes of UTF-8 locales (case-insensitive)

@@ -30,7 +30,7 @@ import           Data.Conduit
 import           Data.List
 import           Data.Map.Strict (Map)
 import qualified Data.Map.Strict as M
-import           Data.Maybe
+import           Data.Maybe.Extra (mapMaybeM)
 import           Data.Monoid
 import           Data.Set (Set)
 import qualified Data.Set as S
@@ -163,7 +163,7 @@ applyTemplate project template nonceParams dir templateText = do
                  defaultConfig
                  templateText
                  (mkStrContextM (contextFunction context)))
-    when (not (S.null missingKeys))
+    unless (S.null missingKeys)
          ($logInfo (T.pack (show (MissingParameters project template missingKeys (configUserConfigPath config)))))
     files :: Map FilePath LB.ByteString <-
         execWriterT $
@@ -185,7 +185,7 @@ applyTemplate project template nonceParams dir templateText = do
         => Map Text Text
         -> String
         -> WriterT (Set String) m (MuType (WriterT (Set String) m))
-    contextFunction context key = do
+    contextFunction context key =
         case M.lookup (T.pack key) context of
             Nothing -> do
                 tell (S.singleton key)
@@ -196,7 +196,7 @@ applyTemplate project template nonceParams dir templateText = do
 writeTemplateFiles
     :: MonadIO m
     => Map (Path Abs File) LB.ByteString -> m ()
-writeTemplateFiles files = do
+writeTemplateFiles files =
     forM_
         (M.toList files)
         (\(fp,bytes) ->
@@ -213,9 +213,8 @@ runTemplateInits dir = do
     case configScmInit config of
         Nothing -> return ()
         Just Git ->
-            do catch
-                   (callProcess (Just dir) menv "git" ["init"])
-                   (\(_ :: ProcessExitedUnsuccessfully) ->
+            catch (callProcess (Just dir) menv "git" ["init"])
+                  (\(_ :: ProcessExitedUnsuccessfully) ->
                          $logInfo "git init failed to run, ignoring ...")
 
 --------------------------------------------------------------------------------
@@ -254,12 +253,12 @@ getTemplates = do
 parseTemplateSet :: Value -> Parser (Set TemplateName)
 parseTemplateSet a = do
     xs <- parseJSON a
-    fmap (S.fromList . catMaybes) (mapM parseTemplate xs)
+    fmap S.fromList (mapMaybeM parseTemplate xs)
   where
     parseTemplate v = do
         o <- parseJSON v
         name <- o .: "name"
-        if isSuffixOf ".hsfiles" name
+        if ".hsfiles" `isSuffixOf` name
             then case parseTemplateNameFromString name of
                      Left{} ->
                          fail ("Unable to parse template name from " <> name)

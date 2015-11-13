@@ -1,12 +1,11 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ExtendedDefaultRules #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
 
--- | Run a IDE configured with the user's project(s).
+-- | Run a IDE configured with the user's package(s).
 
 module Stack.Ide
     (ide, getPackageOptsAndTargetFiles)
@@ -34,6 +33,7 @@ import           Stack.Types.Internal
 import           System.Environment (lookupEnv)
 import           System.Process.Run
 import           System.FilePath (searchPathSeparator)
+
 -- | Launch a GHCi IDE for the given local project targets with the
 -- given options and configure it with the load paths and extensions
 -- of those targets.
@@ -43,7 +43,11 @@ ide
     -> [String] -- ^ GHC options.
     -> m ()
 ide targets useropts = do
-    (_realTargets,_,pkgs) <- ghciSetup Nothing targets
+    let bopts = defaultBuildOpts
+            { boptsTargets = targets
+            , boptsBuildSubset = BSOnlyDependencies
+            }
+    (_realTargets,_,pkgs) <- ghciSetup bopts False Nothing
     pwd <- getWorkingDir
     (pkgopts,_srcfiles) <-
         liftM mconcat $ forM pkgs $ getPackageOptsAndTargetFiles pwd
@@ -56,7 +60,7 @@ ide targets useropts = do
         paths =
             [ "--ide-backend-tools-path=" <>
               intercalate [searchPathSeparator] (map toFilePath bindirs) <>
-              (maybe "" (searchPathSeparator :) mpath)]
+              maybe "" (searchPathSeparator :) mpath]
         args =
             ["--verbose"] <> ["--include=" <> includeDirs pkgopts] <>
             ["--local-work-dir=" ++ toFilePath pwd] <>
@@ -85,7 +89,7 @@ getPackageOptsAndTargetFiles
     => Path Abs Dir -> GhciPkgInfo -> m ([FilePath], [FilePath])
 getPackageOptsAndTargetFiles pwd pkg = do
     dist <- distDirFromDir (ghciPkgDir pkg)
-    autogen <- return (autogenDir dist)
+    let autogen = autogenDir dist
     paths_foo <-
         liftM
             (autogen </>)
@@ -93,11 +97,9 @@ getPackageOptsAndTargetFiles pwd pkg = do
                  ("Paths_" ++ packageNameString (ghciPkgName pkg) ++ ".hs"))
     paths_foo_exists <- fileExists paths_foo
     return
-        ( ["--dist-dir=" <> toFilePath dist] ++
-          map ("--ghc-option=" ++) (ghciPkgOpts pkg)
+        ( ("--dist-dir=" <> toFilePath dist) :
+          map ("--ghc-option=" ++) (concatMap (\(_, bio) -> bioGeneratedOpts bio ++ bioGhcOpts bio) (ghciPkgOpts pkg))
         , mapMaybe
               (fmap toFilePath . stripDir pwd)
               (S.toList (ghciPkgCFiles pkg) <> S.toList (ghciPkgModFiles pkg) <>
-               if paths_foo_exists
-                   then [paths_foo]
-                   else []))
+               [paths_foo | paths_foo_exists]))

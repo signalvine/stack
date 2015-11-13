@@ -70,6 +70,7 @@ import           Stack.Constants
 import           Stack.Config.Docker
 import qualified Stack.Image as Image
 import           Stack.Init
+import           Stack.PackageIndex
 import           Stack.Types
 import           Stack.Types.Internal
 import           System.Directory (getAppUserDataDirectory, createDirectoryIfMissing, canonicalizePath)
@@ -86,10 +87,7 @@ getLatestResolver = do
     let mlts = do
             (x,y) <- listToMaybe (reverse (IntMap.toList (snapshotsLts snapshots)))
             return (LTS x y)
-        snap =
-            case mlts of
-                Nothing -> Nightly (snapshotsNightly snapshots)
-                Just lts -> lts
+        snap = fromMaybe (Nightly (snapshotsNightly snapshots)) mlts
     return (ResolverSnapshot snap)
 
 -- Interprets ConfigMonoid options.
@@ -171,7 +169,7 @@ configFromConfigMonoid configStackRoot configUserConfigPath mproject configMonoi
                  localDir <- liftIO (getAppUserDataDirectory "local") >>= parseAbsDir
                  return $ localDir </> $(mkRelDir "bin")
              Just userPath ->
-                 (liftIO $ canonicalizePath userPath >>= parseAbsDir)
+                 liftIO (canonicalizePath userPath >>= parseAbsDir)
                  `catches`
                  [Handler (\(_ :: IOException) -> throwM $ NoSuchDirectory userPath)
                  ,Handler (\(_ :: PathParseException) -> throwM $ NoSuchDirectory userPath)
@@ -250,7 +248,7 @@ loadMiniConfig
     :: (MonadIO m, HasHttpManager a, MonadReader a m, MonadBaseControl IO m, MonadCatch m, MonadLogger m)
     => Config -> m MiniConfig
 loadMiniConfig config = do
-    menv <- liftIO $ (configEnvOverride config) minimalEnvSettings
+    menv <- liftIO $ configEnvOverride config minimalEnvSettings
     manager <- getHttpManager <$> ask
     ghcVariant <-
         case configGHCVariant0 config of
@@ -283,7 +281,7 @@ loadConfig configArgs mstackYaml = do
             Just (_, _, projectConfig) -> configArgs : projectConfig : extraConfigs
     unless (fromCabalVersion Meta.version `withinRange` configRequireStackVersion config)
         (throwM (BadStackVersionException (configRequireStackVersion config)))
-    return $ LoadConfig
+    return LoadConfig
         { lcConfig          = config
         , lcLoadBuildConfig = loadBuildConfig mproject config
         , lcProjectRoot     = fmap (\(_, fp, _) -> parent fp) mproject
@@ -362,7 +360,7 @@ loadBuildConfig mproject config mresolver mcompiler = do
     resolver <-
         case mresolver of
             Nothing -> return $ projectResolver project'
-            Just aresolver -> do
+            Just aresolver ->
                 runReaderT (makeConcreteResolver aresolver) miniConfig
     let project = project'
             { projectResolver = resolver
@@ -383,6 +381,8 @@ loadBuildConfig mproject config mresolver mcompiler = do
 
     extraPackageDBs <- mapM parseRelAsAbsDir (projectExtraPackageDBs project)
 
+    packageCaches <- runReaderT (getMinimalEnvOverride >>= getPackageCaches) miniConfig
+
     return BuildConfig
         { bcConfig = config
         , bcResolver = projectResolver project
@@ -394,6 +394,7 @@ loadBuildConfig mproject config mresolver mcompiler = do
         , bcFlags = projectFlags project
         , bcImplicitGlobal = isNothing mproject
         , bcGHCVariant = getGHCVariant miniConfig
+        , bcPackageCaches = packageCaches
         }
 
 -- | Resolve a PackageEntry into a list of paths, downloading and cloning as

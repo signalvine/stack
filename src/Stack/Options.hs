@@ -20,6 +20,7 @@ module Stack.Options
     ,testOptsParser
     ,hpcReportOptsParser
     ,pvpBoundsOption
+    ,globalOptsFromMonoid
     ) where
 
 import           Control.Monad.Logger (LogLevel(..))
@@ -34,9 +35,10 @@ import           Data.Monoid
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import           Data.Text.Read (decimal)
+import           Distribution.Version (anyVersion)
+import           Options.Applicative
 import           Options.Applicative.Args
 import           Options.Applicative.Builder.Extra
-import           Options.Applicative.Simple
 import           Options.Applicative.Types (fromM, oneM, readerAsk)
 import           Stack.Config (packagesParser)
 import           Stack.ConfigCmd
@@ -104,7 +106,7 @@ buildOptsParser cmd =
         haddock =
           boolFlags (cmd == Haddock)
                     "haddock"
-                    "generating Haddocks the project(s) in this directory/configuration"
+                    "generating Haddocks the package(s) in this directory/configuration"
                     idm
         haddockDeps =
              maybeBoolFlags
@@ -143,15 +145,15 @@ buildOptsParser cmd =
              help "Fetch packages necessary for the build immediately, useful with --dry-run")
 
         buildSubset =
-            flag' BSOnlySnapshot
-                (long "only-snapshot" <>
-                 help "Only build packages for the snapshot database, not the local database")
-            <|> flag' BSOnlyDependencies
-                (long "only-dependencies" <>
-                 help "Only build packages that are dependencies of targets on the command line")
-            <|> flag' BSOnlyDependencies
+            flag' BSOnlyDependencies
                 (long "dependencies-only" <>
                  help "A synonym for --only-dependencies")
+            <|> flag' BSOnlySnapshot
+                (long ("only-snapshot") <>
+                 help ("Only build packages for the snapshot database, not the local database"))
+            <|> flag' BSOnlyDependencies
+                (long ("only-dependencies") <>
+                 help ("Only build packages that are dependencies of targets on the command line"))
             <|> pure BSAll
 
         fileWatch' =
@@ -174,12 +176,12 @@ buildOptsParser cmd =
 
         tests = boolFlags (cmd == Test)
             "test"
-            "testing the project(s) in this directory/configuration"
+            "testing the package(s) in this directory/configuration"
             idm
 
         benches = boolFlags (cmd == Bench)
             "bench"
-            "benchmarking the project(s) in this directory/configuration"
+            "benchmarking the package(s) in this directory/configuration"
             idm
 
         exec = cmdOption
@@ -224,7 +226,7 @@ readFlag = do
 
 -- | Command-line arguments parser for configuration.
 configOptsParser :: Bool -> Parser ConfigMonoid
-configOptsParser docker =
+configOptsParser hide0 =
     (\opts systemGHC installGHC arch os ghcVariant jobs includes libs skipGHCCheck skipMsys localBin modifyCodePage -> mempty
         { configMonoidDockerOpts = opts
         , configMonoidSystemGHC = systemGHC
@@ -240,63 +242,70 @@ configOptsParser docker =
         , configMonoidLocalBinPath = localBin
         , configMonoidModifyCodePage = modifyCodePage
         })
-    <$> dockerOptsParser docker
+    <$> dockerOptsParser True
     <*> maybeBoolFlags
             "system-ghc"
             "using the system installed GHC (on the PATH) if available and a matching version"
-            idm
+            hide
     <*> maybeBoolFlags
             "install-ghc"
             "downloading and installing GHC if necessary (can be done manually with stack setup)"
-            idm
+            hide
     <*> optional (strOption
             ( long "arch"
            <> metavar "ARCH"
            <> help "System architecture, e.g. i386, x86_64"
+           <> hide
             ))
     <*> optional (strOption
             ( long "os"
            <> metavar "OS"
            <> help "Operating system, e.g. linux, windows"
+           <> hide
             ))
-    <*> optional ghcVariantParser
+    <*> optional (ghcVariantParser hide0)
     <*> optional (option auto
             ( long "jobs"
            <> short 'j'
            <> metavar "JOBS"
            <> help "Number of concurrent jobs to run"
+           <> hide
             ))
     <*> fmap Set.fromList (many (textOption
             ( long "extra-include-dirs"
            <> metavar "DIR"
            <> help "Extra directories to check for C header files"
+           <> hide
             )))
     <*> fmap Set.fromList (many (textOption
             ( long "extra-lib-dirs"
            <> metavar "DIR"
            <> help "Extra directories to check for libraries"
+           <> hide
             )))
     <*> maybeBoolFlags
             "skip-ghc-check"
             "skipping the GHC version and architecture check"
-            idm
+            hide
     <*> maybeBoolFlags
             "skip-msys"
             "skipping the local MSYS installation (Windows only)"
-            idm
+            hide
     <*> optional (strOption
              ( long "local-bin-path"
-             <> metavar "DIR"
-             <> help "Install binaries to DIR"
-              ))
+            <> metavar "DIR"
+            <> help "Install binaries to DIR"
+            <> hide
+             ))
     <*> maybeBoolFlags
             "modify-code-page"
             "setting the codepage to support UTF-8 (Windows only)"
-            idm
+            hide
+  where hide = hideMods hide0
 
 -- | Options parser configuration for Docker.
 dockerOptsParser :: Bool -> Parser DockerOptsMonoid
-dockerOptsParser showOptions =
+dockerOptsParser hide0 =
     DockerOptsMonoid
     <$> pure False
     <*> maybeBoolFlags dockerCmdName
@@ -368,12 +377,11 @@ dockerOptsParser showOptions =
     <*> maybeBoolFlags (dockerOptName dockerSetUserArgName)
                        "setting user in container to match host"
                        hide
+    <*> pure anyVersion
   where
     dockerOptName optName = dockerCmdName ++ "-" ++ T.unpack optName
     maybeStrOption = optional . option str
-    hide = if showOptions
-              then idm
-              else internal <> hidden
+    hide = hideMods hide0
 
 -- | Parser for docker cleanup arguments.
 dockerCleanupOptsParser :: Parser Docker.CleanupOpts
@@ -453,19 +461,15 @@ dotOptsParser = DotOpts
 
 ghciOptsParser :: Parser GhciOpts
 ghciOptsParser = GhciOpts
-             <$> many (textArgument
-                         (metavar "TARGET" <>
-                          help ("If none specified, " <>
-                                "use all packages defined in current directory")))
-             <*> fmap concat (many (argsOption (long "ghc-options" <>
+             <$> switch (long "no-build" <> help "Don't build before launching GHCi")
+             <*> fmap concat (many (argsOption (long "ghci-options" <>
                                        metavar "OPTION" <>
                                        help "Additional options passed to GHCi")))
              <*> optional
                      (strOption (long "with-ghc" <>
                                  metavar "GHC" <>
-                                 help "Use this command for the GHC to run"))
-             <*> switch (long "no-load" <>
-                         help "Don't load modules on start-up")
+                                 help "Use this GHC to run GHCi"))
+             <*> (not <$> boolFlags True "load" "load modules on start-up" idm)
              <*> packagesParser
              <*> optional
                      (textOption
@@ -474,20 +478,18 @@ ghciOptsParser = GhciOpts
                             help "Specify which target should contain the main \
                                  \module to load, such as for an executable for \
                                  \test suite or benchmark."))
+             <*> buildOptsParser Build
 
 -- | Parser for exec command
 execOptsParser :: Maybe SpecialExecCmd -> Parser ExecOpts
 execOptsParser mcmd =
     ExecOpts
-        <$> pure mcmd
+        <$> maybe eoCmdParser pure mcmd
         <*> eoArgsParser
         <*> execOptsExtraParser
   where
-    eoArgsParser :: Parser [String]
-    eoArgsParser = many (strArgument (metavar meta))
-      where
-        meta = (maybe ("CMD ") (const "") mcmd) ++
-               "-- ARGS (e.g. stack ghc -- X.hs -o x)"
+    eoCmdParser = ExecCmd <$> strArgument (metavar "CMD")
+    eoArgsParser = many (strArgument (metavar "-- ARGS (e.g. stack ghc -- X.hs -o x)"))
 
 evalOptsParser :: String -- ^ metavar
                -> Parser EvalOpts
@@ -527,28 +529,39 @@ execOptsExtraParser = eoPlainParser <|>
                           (long "plain" <>
                            help "Use an unmodified environment (only useful with Docker)")
 
-
 -- | Parser for global command-line options.
-globalOptsParser :: Bool -> Parser GlobalOpts
-globalOptsParser defaultTerminal =
-    GlobalOpts <$>
+globalOptsParser :: Bool -> Parser GlobalOptsMonoid
+globalOptsParser hide0 =
+    GlobalOptsMonoid <$>
     optional (strOption (long Docker.reExecArgName <>
                          hidden <>
-                         internal)) <*>
-    logLevelOptsParser <*>
-    configOptsParser False <*>
-    optional abstractResolverOptsParser <*>
-    optional compilerOptsParser <*>
-    flag
-        defaultTerminal
-        False
-        (long "no-terminal" <>
-         help
-             "Override terminal detection in the case of running in a false terminal") <*>
+                         internal <>
+                         hide)) <*>
+    logLevelOptsParser hide0 <*>
+    configOptsParser hide0 <*>
+    optional (abstractResolverOptsParser hide0) <*>
+    optional (compilerOptsParser hide0) <*>
+    maybeBoolFlags
+        "terminal"
+        "overriding terminal detection in the case of running in a false terminal"
+        hide <*>
     optional (strOption (long "stack-yaml" <>
                          metavar "STACK-YAML" <>
                          help ("Override project stack.yaml file " <>
-                               "(overrides any STACK_YAML environment variable)")))
+                               "(overrides any STACK_YAML environment variable)") <>
+                         hide))
+  where hide = hideMods hide0
+
+-- | Create GlobalOpts from GlobalOptsMonoid.
+globalOptsFromMonoid :: Bool -> GlobalOptsMonoid -> GlobalOpts
+globalOptsFromMonoid defaultTerminal gm = GlobalOpts
+    { globalReExecVersion = globalMonoidReExecVersion gm
+    , globalLogLevel = fromMaybe defaultLogLevel (globalMonoidLogLevel gm)
+    , globalConfigMonoid = globalMonoidConfigMonoid gm
+    , globalResolver = globalMonoidResolver gm
+    , globalCompiler = globalMonoidCompiler gm
+    , globalTerminal = fromMaybe defaultTerminal (globalMonoidTerminal gm)
+    , globalStackYaml = globalMonoidStackYaml gm }
 
 initOptsParser :: Parser InitOpts
 initOptsParser =
@@ -582,16 +595,18 @@ initOptsParser =
          help "Use the given resolver, even if not all dependencies are met")
 
 -- | Parse for a logging level.
-logLevelOptsParser :: Parser LogLevel
-logLevelOptsParser =
-  fmap parse
+logLevelOptsParser :: Bool -> Parser (Maybe LogLevel)
+logLevelOptsParser hide =
+  fmap (Just . parse)
        (strOption (long "verbosity" <>
                    metavar "VERBOSITY" <>
-                   help "Verbosity: silent, error, warn, info, debug")) <|>
-  flag defaultLogLevel
-       verboseLevel
+                   help "Verbosity: silent, error, warn, info, debug" <>
+                   hideMods hide)) <|>
+  flag' (Just verboseLevel)
        (short 'v' <> long "verbose" <>
-        help ("Enable verbose mode: verbosity level \"" <> showLevel verboseLevel <> "\""))
+        help ("Enable verbose mode: verbosity level \"" <> showLevel verboseLevel <> "\"") <>
+        hideMods hide) <|>
+  pure Nothing
   where verboseLevel = LevelDebug
         showLevel l =
           case l of
@@ -609,12 +624,13 @@ logLevelOptsParser =
             _ -> LevelOther (T.pack s)
 
 -- | Parser for the resolver
-abstractResolverOptsParser :: Parser AbstractResolver
-abstractResolverOptsParser =
+abstractResolverOptsParser :: Bool -> Parser AbstractResolver
+abstractResolverOptsParser hide =
     option readAbstractResolver
         (long "resolver" <>
          metavar "RESOLVER" <>
-         help "Override resolver in project file")
+         help "Override resolver in project file" <>
+         hideMods hide)
 
 readAbstractResolver :: ReadM AbstractResolver
 readAbstractResolver = do
@@ -630,12 +646,13 @@ readAbstractResolver = do
                 Left e -> readerError $ show e
                 Right x -> return $ ARResolver x
 
-compilerOptsParser :: Parser CompilerVersion
-compilerOptsParser =
+compilerOptsParser :: Bool -> Parser CompilerVersion
+compilerOptsParser hide =
     option readCompilerVersion
         (long "compiler" <>
          metavar "COMPILER" <>
-         help "Use the specified compiler")
+         help "Use the specified compiler" <>
+         hideMods hide)
 
 readCompilerVersion :: ReadM CompilerVersion
 readCompilerVersion = do
@@ -645,13 +662,15 @@ readCompilerVersion = do
         Just x -> return x
 
 -- | GHC variant parser
-ghcVariantParser :: Parser GHCVariant
-ghcVariantParser =
+ghcVariantParser :: Bool -> Parser GHCVariant
+ghcVariantParser hide =
     option
         readGHCVariant
         (long "ghc-variant" <> metavar "VARIANT" <>
          help
-             "Specialized GHC variant, e.g. integersimple (implies --no-system-ghc)")
+             "Specialized GHC variant, e.g. integersimple (implies --no-system-ghc)" <>
+         hideMods hide
+        )
   where
     readGHCVariant = do
         s <- readerAsk
@@ -704,13 +723,12 @@ newOptsParser = (,) <$> newOpts <*> initOptsParser
                  (templateParamArgument
                       (short 'p' <> long "param" <> metavar "KEY:VALUE" <>
                        help
-                           "Parameter for the template in the format key:value"))) <*
-        abortOption ShowHelpText (long "help" <> help "Show help text.")
+                           "Parameter for the template in the format key:value")))
 
 -- | Parser for @stack hpc report@.
 hpcReportOptsParser :: Parser HpcReportOpts
 hpcReportOptsParser = HpcReportOpts
-    <$> (many $ textArgument $ metavar "TARGET_OR_TIX")
+    <$> many (textArgument $ metavar "TARGET_OR_TIX")
     <*> switch (long "all" <> help "Use results from all packages and components")
     <*> optional (strOption (long "destdir" <> help "Output directy for HTML report"))
 
@@ -740,7 +758,7 @@ configCmdSetParser =
             oneM (fieldToValParser field))
   where
     fieldToValParser :: String -> Parser ConfigCmdSet
-    fieldToValParser s = do
+    fieldToValParser s =
         case s of
             "resolver" ->
                 ConfigCmdSetResolver <$>
@@ -749,3 +767,7 @@ configCmdSetParser =
                     idm
             _ ->
                 error "parse stack config set field: only set resolver is implemented"
+
+-- | If argument is True, hides the option from usage and help
+hideMods :: Bool -> Mod f a
+hideMods hide = if hide then internal <> hidden else idm

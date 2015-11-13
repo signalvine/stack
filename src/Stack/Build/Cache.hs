@@ -21,12 +21,6 @@ module Stack.Build.Cache
     , setTestSuccess
     , unsetTestSuccess
     , checkTestSuccess
-    , setTestBuilt
-    , unsetTestBuilt
-    , checkTestBuilt
-    , setBenchBuilt
-    , unsetBenchBuilt
-    , checkBenchBuilt
     , writePrecompiledCache
     , readPrecompiledCache
     ) where
@@ -121,7 +115,9 @@ tryGetCache :: (MonadIO m, BinarySchema a)
             => (Path Abs Dir -> m (Path Abs File))
             -> Path Abs Dir
             -> m (Maybe a)
-tryGetCache get' dir = get' dir >>= decodeFileOrFailDeep . toFilePath
+tryGetCache get' dir = do
+    fp <- get' dir
+    decodeFileOrFailDeep fp
 
 -- | Write the dirtiness cache for this package's files.
 writeBuildCache :: (MonadIO m, MonadReader env m, HasConfig env, MonadThrow m, MonadLogger m, HasEnvConfig env)
@@ -130,9 +126,9 @@ writeBuildCache dir times =
     writeCache
         dir
         buildCacheFile
-        (BuildCache
+        BuildCache
          { buildCacheTimes = times
-         })
+         }
 
 -- | Write the dirtiness cache for this package's configuration.
 writeConfigCache :: (MonadIO m, MonadReader env m, HasConfig env, MonadThrow m, MonadLogger m, HasEnvConfig env)
@@ -167,7 +163,7 @@ writeCache :: (BinarySchema a, MonadIO m)
            -> m ()
 writeCache dir get' content = do
     fp <- get' dir
-    taggedEncodeFile (toFilePath fp) content
+    taggedEncodeFile fp content
 
 flagCacheFile :: (MonadIO m, MonadThrow m, MonadReader env m, HasEnvConfig env)
               => Installed
@@ -184,8 +180,9 @@ flagCacheFile installed = do
 tryGetFlagCache :: (MonadIO m, MonadThrow m, MonadReader env m, HasEnvConfig env)
                 => Installed
                 -> m (Maybe ConfigCache)
-tryGetFlagCache gid =
-    flagCacheFile gid >>= decodeFileOrFailDeep . toFilePath
+tryGetFlagCache gid = do
+    fp <- flagCacheFile gid
+    decodeFileOrFailDeep fp
 
 writeFlagCache :: (MonadIO m, MonadReader env m, HasEnvConfig env, MonadThrow m)
                => Installed
@@ -195,7 +192,7 @@ writeFlagCache gid cache = do
     file <- flagCacheFile gid
     liftIO $ do
         createTree (parent file)
-        taggedEncodeFile (toFilePath file) cache
+        taggedEncodeFile file cache
 
 -- | Mark a test suite as having succeeded
 setTestSuccess :: (MonadIO m, MonadLogger m, MonadThrow m, MonadReader env m, HasConfig env, HasEnvConfig env)
@@ -225,64 +222,6 @@ checkTestSuccess dir =
     liftM
         (fromMaybe False)
         (tryGetCache testSuccessFile dir)
-
--- | Mark a test suite as having built
-setTestBuilt :: (MonadIO m, MonadLogger m, MonadThrow m, MonadReader env m, HasConfig env, HasEnvConfig env)
-               => Path Abs Dir
-               -> m ()
-setTestBuilt dir =
-    writeCache
-        dir
-        testBuiltFile
-        True
-
--- | Mark a test suite as not having built
-unsetTestBuilt :: (MonadIO m, MonadLogger m, MonadThrow m, MonadReader env m, HasConfig env, HasEnvConfig env)
-                 => Path Abs Dir
-                 -> m ()
-unsetTestBuilt dir =
-    writeCache
-        dir
-        testBuiltFile
-        False
-
--- | Check if the test suite already built
-checkTestBuilt :: (MonadIO m, MonadLogger m, MonadThrow m, MonadReader env m, HasConfig env, HasEnvConfig env)
-                 => Path Abs Dir
-                 -> m Bool
-checkTestBuilt dir =
-    liftM
-        (fromMaybe False)
-        (tryGetCache testBuiltFile dir)
-
--- | Mark a bench suite as having built
-setBenchBuilt :: (MonadIO m, MonadLogger m, MonadThrow m, MonadReader env m, HasConfig env, HasEnvConfig env)
-               => Path Abs Dir
-               -> m ()
-setBenchBuilt dir =
-    writeCache
-        dir
-        benchBuiltFile
-        True
-
--- | Mark a bench suite as not having built
-unsetBenchBuilt :: (MonadIO m, MonadLogger m, MonadThrow m, MonadReader env m, HasConfig env, HasEnvConfig env)
-                 => Path Abs Dir
-                 -> m ()
-unsetBenchBuilt dir =
-    writeCache
-        dir
-        benchBuiltFile
-        False
-
--- | Check if the bench suite already built
-checkBenchBuilt :: (MonadIO m, MonadLogger m, MonadThrow m, MonadReader env m, HasConfig env, HasEnvConfig env)
-                 => Path Abs Dir
-                 -> m Bool
-checkBenchBuilt dir =
-    liftM
-        (fromMaybe False)
-        (tryGetCache benchBuiltFile dir)
 
 --------------------------------------
 -- Precompiled Cache
@@ -357,7 +296,7 @@ writePrecompiledCache baseConfigOpts pkgident copts depIDs mghcPkgId exes = do
     exes' <- forM (Set.toList exes) $ \exe -> do
         name <- parseRelFile $ T.unpack exe
         return $ toFilePath $ bcoSnapInstallRoot baseConfigOpts </> bindirSuffix </> name
-    liftIO $ taggedEncodeFile (toFilePath file) PrecompiledCache
+    liftIO $ taggedEncodeFile file PrecompiledCache
         { pcLibrary = mlibpath
         , pcExes = exes'
         }
@@ -371,4 +310,4 @@ readPrecompiledCache :: (MonadThrow m, MonadReader env m, HasEnvConfig env, Mona
                      -> m (Maybe PrecompiledCache)
 readPrecompiledCache pkgident copts depIDs = do
     file <- precompiledCacheFile pkgident copts depIDs
-    decodeFileOrFailDeep $ toFilePath file
+    decodeFileOrFailDeep file

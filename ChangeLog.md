@@ -2,7 +2,7 @@
 
 Major changes:
 
-* GHCJS can now be used with stackage snapshots.
+* GHCJS can now be used with stackage snapshots via the new `compiler` field.
 * Windows installers are now available:
   [download them here](https://github.com/commercialhaskell/stack/blob/release/doc/install_and_upgrade.md#windows) [#613](https://github.com/commercialhaskell/stack/issues/613)
 
@@ -13,11 +13,19 @@ Other enhancements:
 * Added a `stack config set resolver RESOLVER` command. Part of work on [#115](https://github.com/commercialhaskell/stack/issues/115)
 * `stack setup` can now install GHCJS on windows.  See [#1145](https://github.com/commercialhaskell/stack/issues/1145) and [#749](https://github.com/commercialhaskell/stack/issues/749)
 * `stack hpc report` command added, which generates reports for HPC tix files
+* `stack ghci` now accepts all the flags accepted by `stack build`.  See [#1186](https://github.com/commercialhaskell/stack/issues/1186)
+* `stack ghci` builds the project before launching GHCi.  If the build fails, optimistically launch GHCi anyway.  Use `stack ghci --no-build` option to disable [#1065](https://github.com/commercialhaskell/stack/issues/1065)
+* `stack ghci` now detects and warns about various circumstances where it is liable to fail. See [#1270](https://github.com/commercialhaskell/stack/issues/1270)
+* Added `require-docker-version` configuration option
+* Packages will now usually be built along with their tests and benchmarks. See [#1166](https://github.com/commercialhaskell/stack/issues/1166)
 
 Bug fixes:
 
-* Haddocks not copied for dependencies [#1105](https://github.com/commercialhaskell/stack/issues/1105)
+* Fix: Haddocks not copied for dependencies [#1105](https://github.com/commercialhaskell/stack/issues/1105)
+* Fix: Global options did not work consistently after subcommand [#519](https://github.com/commercialhaskell/stack/issues/519)
+* Fix: 'stack ghci' doesn't notice that a module got deleted [#1180](https://github.com/commercialhaskell/stack/issues/1180)
 * Rebuild when cabal file is changed
+* Fix: Paths in GHC warnings not canonicalized, nor those for packages in subdirectories or outside the project root [#1259](https://github.com/commercialhaskell/stack/issues/1259)
 
 ## v0.1.6.0
 

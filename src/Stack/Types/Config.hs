@@ -13,7 +13,109 @@
 
 -- | The Config type.
 
-module Stack.Types.Config where
+module Stack.Types.Config
+  (
+  -- * Main configuration types and classes
+  -- ** HasPlatform & HasStackRoot
+   HasPlatform(..)
+  ,HasStackRoot(..)
+  -- ** Config & HasConfig
+  ,Config(..)
+  ,HasConfig(..)
+  ,askConfig
+  ,askLatestSnapshotUrl
+  ,explicitSetupDeps
+  ,getMinimalEnvOverride
+  -- ** BuildConfig & HasBuildConfig
+  ,BuildConfig(..)
+  ,bcRoot
+  ,bcWorkDir
+  ,HasBuildConfig(..)
+  -- ** GHCVariant & HasGHCVariant
+  ,GHCVariant(..)
+  ,ghcVariantName
+  ,ghcVariantSuffix
+  ,parseGHCVariant
+  ,HasGHCVariant(..)
+  ,snapshotsDir
+  -- ** EnvConfig & HasEnvConfig
+  ,EnvConfig(..)
+  ,HasEnvConfig(..)
+  ,getWhichCompiler
+  -- * Details
+  -- ** ApplyGhcOptions
+  ,ApplyGhcOptions(..)
+  -- ** ConfigException
+  ,ConfigException(..)
+  -- ** ConfigMonoid
+  ,ConfigMonoid(..)
+  -- ** EnvSettings
+  ,EnvSettings(..)
+  ,minimalEnvSettings
+  -- ** GlobalOpts & GlobalOptsMonoid
+  ,GlobalOpts(..)
+  ,GlobalOptsMonoid(..)
+  ,defaultLogLevel
+  -- ** LoadConfig
+  ,LoadConfig(..)
+  -- ** PackageEntry & PackageLocation
+  ,PackageEntry(..)
+  ,peExtraDep
+  ,PackageLocation(..)
+  -- ** PackageIndex, IndexName & IndexLocation
+  ,PackageIndex(..)
+  ,IndexName(..)
+  ,configPackageIndex
+  ,configPackageIndexCache
+  ,configPackageIndexGz
+  ,configPackageIndexRoot
+  ,configPackageTarball
+  ,indexNameText
+  ,IndexLocation(..)
+  -- ** Project & ProjectAndConfigMonoid
+  ,Project(..)
+  ,ProjectAndConfigMonoid(..)
+  -- ** PvpBounds
+  ,PvpBounds(..)
+  ,parsePvpBounds
+  -- ** Resolver & AbstractResolver
+  ,Resolver(..)
+  ,parseResolverText
+  ,resolverName
+  ,AbstractResolver(..)
+  -- ** SCM
+  ,SCM(..)
+  -- * Paths
+  ,bindirSuffix
+  ,configInstalledCache
+  ,configMiniBuildPlanCache
+  ,configProjectWorkDir
+  ,docDirSuffix
+  ,flagCacheLocal
+  ,extraBinDirs
+  ,hpcReportDir
+  ,installationRootDeps
+  ,installationRootLocal
+  ,packageDatabaseDeps
+  ,packageDatabaseExtra
+  ,packageDatabaseLocal
+  ,platformOnlyRelDir
+  ,platformVariantRelDir
+  ,useShaPathOnWindows
+  ,workDirRel
+  -- * Command-specific types
+  -- ** Eval
+  ,EvalOpts(..)
+  -- ** Exec
+  ,ExecOpts(..)
+  ,SpecialExecCmd(..)
+  ,ExecOptsExtra(..)
+  -- ** Setup
+  ,DownloadInfo(..)
+  ,VersionedDownloadInfo(..)
+  ,SetupInfo(..)
+  ,SetupInfoLocation(..)
+  ) where
 
 import           Control.Applicative
 import           Control.Arrow ((&&&))
@@ -58,6 +160,7 @@ import           Stack.Types.Docker
 import           Stack.Types.FlagName
 import           Stack.Types.Image
 import           Stack.Types.PackageIdentifier
+import           Stack.Types.PackageIndex
 import           Stack.Types.PackageName
 import           Stack.Types.Version
 import           System.Process.Read (EnvOverride)
@@ -243,16 +346,14 @@ data EnvSettings = EnvSettings
     deriving (Show, Eq, Ord)
 
 data ExecOpts = ExecOpts
-    { eoCmd :: !(Maybe SpecialExecCmd)
-    -- ^ When 'Nothing', then the program to run is the head of
-    -- 'eoArgs'. See:
-    -- https://github.com/commercialhaskell/stack/issues/806
+    { eoCmd :: !SpecialExecCmd
     , eoArgs :: ![String]
     , eoExtra :: !ExecOptsExtra
     } deriving (Show)
 
 data SpecialExecCmd
-    = ExecGhc
+    = ExecCmd String
+    | ExecGhc
     | ExecRunGhc
     deriving (Show, Eq)
 
@@ -279,6 +380,28 @@ data GlobalOpts = GlobalOpts
     , globalTerminal     :: !Bool -- ^ We're in a terminal?
     , globalStackYaml    :: !(Maybe FilePath) -- ^ Override project stack.yaml
     } deriving (Show)
+
+-- | Parsed global command-line options monoid.
+data GlobalOptsMonoid = GlobalOptsMonoid
+    { globalMonoidReExecVersion :: !(Maybe String) -- ^ Expected re-exec in container version
+    , globalMonoidLogLevel     :: !(Maybe LogLevel) -- ^ Log level
+    , globalMonoidConfigMonoid :: !ConfigMonoid -- ^ Config monoid, for passing into 'loadConfig'
+    , globalMonoidResolver     :: !(Maybe AbstractResolver) -- ^ Resolver override
+    , globalMonoidCompiler     :: !(Maybe CompilerVersion) -- ^ Compiler override
+    , globalMonoidTerminal     :: !(Maybe Bool) -- ^ We're in a terminal?
+    , globalMonoidStackYaml    :: !(Maybe FilePath) -- ^ Override project stack.yaml
+    } deriving (Show)
+
+instance Monoid GlobalOptsMonoid where
+    mempty = GlobalOptsMonoid Nothing Nothing mempty Nothing Nothing Nothing Nothing
+    mappend l r = GlobalOptsMonoid
+        { globalMonoidReExecVersion = globalMonoidReExecVersion l <|> globalMonoidReExecVersion r
+        , globalMonoidLogLevel = globalMonoidLogLevel l <|> globalMonoidLogLevel r
+        , globalMonoidConfigMonoid = globalMonoidConfigMonoid l <> globalMonoidConfigMonoid r
+        , globalMonoidResolver = globalMonoidResolver l <|> globalMonoidResolver r
+        , globalMonoidCompiler = globalMonoidCompiler l <|> globalMonoidCompiler r
+        , globalMonoidTerminal = globalMonoidTerminal l <|> globalMonoidTerminal r
+        , globalMonoidStackYaml = globalMonoidStackYaml l <|> globalMonoidStackYaml r }
 
 -- | Either an actual resolver value, or an abstract description of one (e.g.,
 -- latest nightly).
@@ -326,15 +449,17 @@ data BuildConfig = BuildConfig
       -- for providing better error messages.
     , bcGHCVariant :: !GHCVariant
       -- ^ The variant of GHC used to select a GHC bindist.
+    , bcPackageCaches :: !(Map PackageIdentifier (PackageIndex, PackageCache))
+      -- ^ Shared package cache map
     }
 
 -- | Directory containing the project's stack.yaml file
 bcRoot :: BuildConfig -> Path Abs Dir
 bcRoot = parent . bcStackYaml
 
--- | Directory containing the project's stack.yaml file
+-- | @"'bcRoot'/.stack-work"@
 bcWorkDir :: BuildConfig -> Path Abs Dir
-bcWorkDir = (</> workDirRel) . parent . bcStackYaml
+bcWorkDir = (</> workDirRel) . bcRoot
 
 -- | Configuration after the environment has been setup.
 data EnvConfig = EnvConfig
@@ -839,9 +964,6 @@ configMonoidLocalBinPathName = "local-bin-path"
 configMonoidImageOptsName :: Text
 configMonoidImageOptsName = "image"
 
-configMonoidTemplatesName :: Text
-configMonoidTemplatesName = "templates"
-
 configMonoidScmInitName :: Text
 configMonoidScmInitName = "scm-init"
 
@@ -877,16 +999,6 @@ configMonoidApplyGhcOptionsName = "apply-ghc-options"
 
 configMonoidAllowNewerName :: Text
 configMonoidAllowNewerName = "allow-newer"
-
--- | Newtype for non-orphan FromJSON instance.
-newtype VersionRangeJSON = VersionRangeJSON { unVersionRangeJSON :: VersionRange }
-
--- | Parse VersionRange.
-instance FromJSON VersionRangeJSON where
-  parseJSON = withText "VersionRange"
-                (\s -> maybe (fail ("Invalid cabal-style VersionRange: " ++ T.unpack s))
-                             (return . VersionRangeJSON)
-                             (Distribution.Text.simpleParse (T.unpack s)))
 
 data ConfigException
   = ParseConfigFileException (Path Abs File) ParseException
@@ -931,9 +1043,9 @@ instance Show ConfigException where
         [ "The version of stack you are using ("
         , show (fromCabalVersion Meta.version)
         , ") is outside the required\n"
-        ,"version range ("
+        ,"version range specified in stack.yaml ("
         , T.unpack (versionRangeText requiredRange)
-        , ") specified in stack.yaml." ]
+        , ")." ]
     show (NoMatchingSnapshot names) = concat
         [ "There was no snapshot found that matched the package "
         , "bounds in your .cabal files.\n"
@@ -992,6 +1104,7 @@ configPackageTarball iname ident = do
     base <- parseRelFile $ packageIdentifierString ident ++ ".tar.gz"
     return (root </> $(mkRelDir "packages") </> name </> ver </> base)
 
+-- | @".stack-work"@
 workDirRel :: Path Rel Dir
 workDirRel = $(mkRelDir ".stack-work")
 
@@ -1012,14 +1125,6 @@ platformOnlyRelDir
 platformOnlyRelDir = do
     platform <- asks getPlatform
     parseRelDir (Distribution.Text.display platform)
-
--- | Path to .shake files.
-configShakeFilesDir :: (MonadReader env m, HasBuildConfig env) => m (Path Abs Dir)
-configShakeFilesDir = liftM (</> $(mkRelDir "shake")) configProjectWorkDir
-
--- | Where to unpack packages for local build
-configLocalUnpackDir :: (MonadReader env m, HasBuildConfig env) => m (Path Abs Dir)
-configLocalUnpackDir = liftM (</> $(mkRelDir "unpacked")) configProjectWorkDir
 
 -- | Directory containing snapshots
 snapshotsDir :: (MonadReader env m, HasConfig env, HasGHCVariant env, MonadThrow m) => m (Path Abs Dir)

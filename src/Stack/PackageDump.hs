@@ -1,6 +1,5 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TupleSections #-}
@@ -47,6 +46,7 @@ import           Data.IORef
 import           Data.Map (Map)
 import qualified Data.Map as Map
 import           Data.Maybe (catMaybes, listToMaybe)
+import           Data.Maybe.Extra (mapMaybeM)
 import qualified Data.Set as Set
 import qualified Data.Text.Encoding as T
 import           Data.Typeable (Typeable)
@@ -108,10 +108,9 @@ ghcPkgCmdArgs
     -> m a
 ghcPkgCmdArgs cmd menv wc mpkgDbs sink = do
     case reverse mpkgDbs of
-        (pkgDb:_) -> (createDatabase menv wc) pkgDb -- TODO maybe use some retry logic instead?
+        (pkgDb:_) -> createDatabase menv wc pkgDb -- TODO maybe use some retry logic instead?
         _ -> return ()
-    a <- sinkProcessStdout Nothing menv (ghcPkgExeName wc) args sink
-    return a
+    sinkProcessStdout Nothing menv (ghcPkgExeName wc) args sink
   where
     args = concat
         [ case mpkgDbs of
@@ -129,14 +128,14 @@ newInstalledCache = liftIO $ InstalledCache <$> newIORef (InstalledCacheInner Ma
 -- empty cache.
 loadInstalledCache :: (MonadLogger m, MonadIO m) => Path Abs File -> m InstalledCache
 loadInstalledCache path = do
-    m <- taggedDecodeOrLoad (toFilePath path) (return $ InstalledCacheInner Map.empty)
-    liftIO $ fmap InstalledCache $ newIORef m
+    m <- taggedDecodeOrLoad path (return $ InstalledCacheInner Map.empty)
+    liftIO $ InstalledCache <$> newIORef m
 
 -- | Save a @InstalledCache@ to disk
 saveInstalledCache :: MonadIO m => Path Abs File -> InstalledCache -> m ()
 saveInstalledCache path (InstalledCache ref) = liftIO $ do
     createTree (parent path)
-    readIORef ref >>= taggedEncodeFile (toFilePath path)
+    readIORef ref >>= taggedEncodeFile path
 
 -- | Prune a list of possible packages down to those whose dependencies are met.
 --
@@ -153,7 +152,7 @@ pruneDeps
     -> Map name item
 pruneDeps getName getId getDepends chooseBest =
       Map.fromList
-    . (map $ \item -> (getName $ getId item, item))
+    . fmap (getName . getId &&& id)
     . loop Set.empty Set.empty []
   where
     loop foundIds usedNames foundItems dps =
@@ -307,10 +306,7 @@ conduitDumpPackage = (=$= CL.catMaybes) $ eachSection $ do
                 _ -> throwM $ MissingSingleField k m
         -- Can't fail: if not found, same as an empty list. See:
         -- https://github.com/fpco/stack/issues/182
-        parseM k =
-            case Map.lookup k m of
-                Just vs -> vs
-                Nothing -> []
+        parseM k = Map.findWithDefault [] k m
 
         parseDepend :: MonadThrow m => ByteString -> m (Maybe GhcPkgId)
         parseDepend "builtin_rts" = return Nothing
@@ -336,7 +332,7 @@ conduitDumpPackage = (=$= CL.catMaybes) $ eachSection $ do
                 libraries = parseM "hs-libraries"
                 exposedModules = parseM "exposed-modules"
                 exposed = parseM "exposed"
-            depends <- mapM parseDepend $ parseM "depends"
+            depends <- mapMaybeM parseDepend $ parseM "depends"
 
             let parseQuoted key =
                     case mapM (P.parseOnly (argsParser NoEscaping) . T.decodeUtf8) val of
@@ -354,7 +350,7 @@ conduitDumpPackage = (=$= CL.catMaybes) $ eachSection $ do
                 , dpLibDirs = libDirPaths
                 , dpLibraries = S8.words $ S8.unwords libraries
                 , dpHasExposedModules = not (null libraries || null exposedModules)
-                , dpDepends = catMaybes (depends :: [Maybe GhcPkgId])
+                , dpDepends = depends
                 , dpHaddockInterfaces = haddockInterfaces
                 , dpHaddockHtml = listToMaybe haddockHtml
                 , dpProfiling = ()

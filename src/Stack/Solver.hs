@@ -47,6 +47,7 @@ cabalSolver :: (MonadIO m, MonadLogger m, MonadMask m, MonadBaseControl IO m, Mo
             -> [String] -- ^ additional arguments
             -> m (CompilerVersion, Map PackageName (Version, Map FlagName Bool))
 cabalSolver wc cabalfps constraints userFlags cabalArgs = withSystemTempDirectory "cabal-solver" $ \dir -> do
+    when (null cabalfps) $ throwM SolverNoCabalFiles
     configLines <- getCabalConfig dir constraints
     let configFile = dir FP.</> "cabal.config"
     liftIO $ S.writeFile configFile $ encodeUtf8 $ T.unlines configLines
@@ -99,7 +100,7 @@ cabalSolver wc cabalfps constraints userFlags cabalArgs = withSystemTempDirector
              : "--package-db=global"
              : cabalArgs ++
                toConstraintArgs userFlags ++
-               (map toFilePath cabalfps) ++
+               fmap toFilePath cabalfps ++
                ["--ghcjs" | wc == Ghcjs]
 
     $logInfo "Asking cabal to calculate a build plan, please wait"
@@ -178,8 +179,6 @@ solveExtraDeps :: (MonadReader env m, HasEnvConfig env, MonadIO m, MonadMask m, 
                => Bool -- ^ modify stack.yaml?
                -> m ()
 solveExtraDeps modStackYaml = do
-    $logInfo "This command is not guaranteed to give you a perfect build plan"
-    $logInfo "It's possible that even with the changes generated below, you will still need to do some manual tweaking"
     econfig <- asks getEnvConfig
     bconfig <- asks getBuildConfig
     snapshot <-
@@ -205,11 +204,13 @@ solveExtraDeps modStackYaml = do
     let newDeps = extraDeps `Map.difference` packages
         newFlags = Map.filter (not . Map.null) $ fmap snd newDeps
 
+    $logInfo "This command is not guaranteed to give you a perfect build plan"
     if Map.null newDeps
         then $logInfo "No needed changes found"
         else do
+            $logInfo "It's possible that even with the changes generated below, you will still need to do some manual tweaking"
             let o = object
-                    $ ("extra-deps" .= (map fromTuple $ Map.toList $ fmap fst newDeps))
+                    $ ("extra-deps" .= map fromTuple (Map.toList $ fmap fst newDeps))
                     : (if Map.null newFlags
                         then []
                         else ["flags" .= newFlags])

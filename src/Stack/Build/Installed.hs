@@ -27,6 +27,7 @@ import           Data.Map.Strict              (Map)
 import qualified Data.Map.Strict              as M
 import qualified Data.Map.Strict              as Map
 import           Data.Maybe
+import           Data.Maybe.Extra             (mapMaybeM)
 import           Data.Monoid
 import qualified Data.Text                    as T
 import           Network.HTTP.Client.Conduit  (HasHttpManager)
@@ -77,9 +78,9 @@ getInstalled menv opts sourceMap = do
 
     (installedLibs0, globalDumpPkgs) <- loadDatabase' Nothing []
     (installedLibs1, _extraInstalled) <-
-      (foldM (\lhs' pkgdb -> do
-        lhs'' <- loadDatabase' (Just (ExtraGlobal, pkgdb)) (fst lhs')
-        return lhs'') (installedLibs0, globalDumpPkgs) extraDBPaths)
+      (foldM (\lhs' pkgdb ->
+        loadDatabase' (Just (ExtraGlobal, pkgdb)) (fst lhs')
+        ) (installedLibs0, globalDumpPkgs) extraDBPaths)
     (installedLibs2, snapshotDumpPkgs) <-
         loadDatabase' (Just (InstalledTo Snap, snapDBPath)) installedLibs1
     (installedLibs3, localDumpPkgs) <-
@@ -136,7 +137,7 @@ loadDatabase menv opts mcache sourceMap mdb lhs0 = do
     (lhs1', dps) <- ghcPkgDump menv wc (fmap snd (maybeToList mdb))
                 $ conduitDumpPackage =$ sink
     let ghcjsHack = wc == Ghcjs && isNothing mdb
-    lhs1 <- liftM catMaybes $ mapM (processLoadResult mdb ghcjsHack) lhs1'
+    lhs1 <- mapMaybeM (processLoadResult mdb ghcjsHack) lhs1'
     let lhs = pruneDeps
             id
             lhId
@@ -198,7 +199,7 @@ processLoadResult mdb _ (reason, lh) = do
             NeedsHaddock -> " it needing haddocks."
             UnknownPkg -> " it being unknown to the resolver / extra-deps."
             WrongLocation mloc loc -> " wrong location: " <> T.pack (show (mloc, loc))
-            WrongVersion actual wanted -> T.concat $
+            WrongVersion actual wanted -> T.concat
                 [ " wanting version "
                 , versionText wanted
                 , " instead of "

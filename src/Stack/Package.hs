@@ -33,8 +33,22 @@ module Stack.Package
   ,packageIdentifier
   ,autogenDir
   ,checkCabalFileName
-  ,printCabalFileWarning)
+  ,printCabalFileWarning
+  ,cabalFilePackageId)
   where
+
+#if __GLASGOW_HASKELL__ < 710
+import           Control.Applicative ((<$>), (<*>))
+#endif
+
+import           Control.Monad.Logger
+import           Control.Monad.Trans.Control
+import qualified Data.Version as V
+import qualified Distribution.Package as D
+import qualified Distribution.PackageDescription as D
+import qualified Distribution.PackageDescription.Parse as D
+import qualified Distribution.Verbosity as D
+import           Stack.Types
 
 import           Control.Arrow ((&&&))
 import           Control.Exception hiding (try,catch)
@@ -1096,3 +1110,16 @@ resolveDirOrWarn :: (MonadThrow m,MonadIO m,MonadLogger m,MonadReader (Path Abs 
                  => FilePath.FilePath
                  -> m (Maybe (Path Abs Dir))
 resolveDirOrWarn = resolveOrWarn "Directory" resolveDirMaybe
+
+-- | Extract the @PackageIdentifier@ given an exploded haskell package
+-- path.
+cabalFilePackageId
+    :: (MonadCatch m, MonadBaseControl IO m, MonadIO m, MonadMask m, MonadLogger m, MonadThrow m)
+    => FilePath -> m PackageIdentifier
+cabalFilePackageId fp = do
+    pkgDescr <- liftIO (D.readPackageDescription D.silent fp)
+    (toStackPI . D.package . D.packageDescription) pkgDescr
+  where
+    toStackPI (D.PackageIdentifier (D.PackageName name) ver) =
+        PackageIdentifier <$> parsePackageNameFromString name <*>
+        parseVersionFromString (V.showVersion ver)

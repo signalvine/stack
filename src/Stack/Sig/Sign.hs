@@ -39,7 +39,7 @@ import           Network.HTTP.Conduit
 import           Network.HTTP.Types (status200, methodPut)
 import           Path
 import           Path.IO
-import qualified Stack.Sig.Cabal as Cabal
+import           Stack.Package
 import qualified Stack.Sig.GPG as GPG
 import           Stack.Types
 import           System.Directory (getDirectoryContents)
@@ -76,7 +76,7 @@ sign url filePath = do
                       parseRelFile
                           (head cabalFiles)
                   pkg <-
-                      Cabal.cabalFilePackageId
+                      cabalFilePackageId
                           (toFilePath
                                (tempDir </> cabalFile))
                   signPackage url pkg filePath))

@@ -103,7 +103,6 @@ library
                      Stack.Build.Source
                      Stack.Build.Target
                      Stack.Sig
-                     Stack.Sig.Cabal
                      Stack.Sig.GPG
                      Stack.Sig.Sign
                      Stack.Upgrade

@@ -41,15 +41,6 @@ module Stack.Package
 import           Control.Applicative ((<$>), (<*>))
 #endif
 
-import           Control.Monad.Logger
-import           Control.Monad.Trans.Control
-import qualified Data.Version as V
-import qualified Distribution.Package as D
-import qualified Distribution.PackageDescription as D
-import qualified Distribution.PackageDescription.Parse as D
-import qualified Distribution.Verbosity as D
-import           Stack.Types
-
 import           Control.Arrow ((&&&))
 import           Control.Exception hiding (try,catch)
 import           Control.Monad
@@ -57,6 +48,7 @@ import           Control.Monad.Catch
 import           Control.Monad.IO.Class
 import           Control.Monad.Logger (MonadLogger,logWarn)
 import           Control.Monad.Reader
+import           Control.Monad.Trans.Control
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as C8
 import           Data.Either
@@ -74,16 +66,21 @@ import           Data.Text (Text)
 import qualified Data.Text as T
 import           Data.Text.Encoding (decodeUtf8, decodeUtf8With)
 import           Data.Text.Encoding.Error (lenientDecode)
+import           Data.Version (showVersion)
 import           Distribution.Compiler
 import           Distribution.ModuleName (ModuleName)
 import qualified Distribution.ModuleName as Cabal
 import           Distribution.Package hiding (Package,PackageName,packageName,packageVersion,PackageIdentifier)
+import qualified Distribution.Package as D
 import           Distribution.PackageDescription hiding (FlagName)
+import qualified Distribution.PackageDescription as D
 import           Distribution.PackageDescription.Parse
+import qualified Distribution.PackageDescription.Parse as D
 import           Distribution.ParseUtils
 import           Distribution.Simple.Utils
 import           Distribution.System (OS (..), Arch, Platform (..))
 import           Distribution.Text (display, simpleParse)
+import qualified Distribution.Verbosity as D
 import           Path as FL
 import           Path.Extra
 import           Path.Find
@@ -1122,4 +1119,4 @@ cabalFilePackageId fp = do
   where
     toStackPI (D.PackageIdentifier (D.PackageName name) ver) =
         PackageIdentifier <$> parsePackageNameFromString name <*>
-        parseVersionFromString (V.showVersion ver)
+        parseVersionFromString (showVersion ver)

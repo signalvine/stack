@@ -22,6 +22,7 @@ import           Control.Applicative ((<$>))
 import           Control.Monad.Catch (MonadThrow, throwM)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import qualified Data.ByteString.Char8 as C
+import           Data.Char (isSpace)
 import           Data.List (find)
 import           Data.Monoid ((<>))
 import qualified Data.Text as T
@@ -53,7 +54,7 @@ fullFingerprint (Fingerprint fp) = do
                  return
                  (let hasFingerprint = (==) ["Key", "fingerprint", "="] .
                           take 3
-                      fingerprint = T.pack .
+                      fingerprint = T.filter (not . isSpace) . T.pack .
                           unwords .
                           drop 3
                   in Fingerprint . fingerprint <$>

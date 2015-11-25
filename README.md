@@ -1,11 +1,10 @@
-## The Haskell Tool Stack
+## HPC-enabled stack
 
-[![Build Status](https://travis-ci.org/commercialhaskell/stack.svg?branch=master)](https://travis-ci.org/commercialhaskell/stack)
-[![Windows build status](https://ci.appveyor.com/api/projects/status/c1c7uvmw6x1dupcl?svg=true)](https://ci.appveyor.com/project/snoyberg/stack)
-[![Release](https://img.shields.io/github/release/commercialhaskell/stack.svg)](https://github.com/commercialhaskell/stack/releases)
+This is our fork of stack which is built against a recent (unreleased) Cabal to
+protect against [Cabal bug #2870](https://github.com/haskell/cabal/issues/2870).
 
-`stack` is a cross-platform program for developing Haskell projects. It is aimed
-at Haskellers both new and experienced.
+For some background, see also
+[GHC ticket #10952](https://ghc.haskell.org/trac/ghc/ticket/10952).
 
-See [haskellstack.org](http://haskellstack.org) or the `doc` directory for more
-information.
+This version of stack is only needed on jenkins; developers may continue to use
+normal stack.
